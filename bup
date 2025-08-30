@@ -1,0 +1,166 @@
+#!/bin/bash
+
+# bup is a utility that generates a tarball backup for a given directory.
+# It will automatically eliminate naming conflicts and executes pre- and
+# post- scripts, if they exist, to perform any needed prep or cleanup
+# for a project.  (For example you could run `cargo clean` before
+# backup and `cargo build` after.)
+
+show_help() {
+    cat << EOF
+bup - Backup utility that creates gzipped tarballs of directories
+
+USAGE:
+    $0 <directory> [OPTIONS]
+
+ARGUMENTS:
+    directory           Directory to backup
+
+OPTIONS:
+    -o output_directory Specify alternative directory to store the tarball
+                       (default: current directory)
+    -v, --verbose      Enable verbose output and set BUP_VERBOSE environment
+                       variable for pre/post scripts
+    -h, --help         Show this help message
+
+DESCRIPTION:
+    Creates a gzipped tarball of the specified directory with automatic naming:
+    bak.[directory_name].[YYYY-mm-dd].tgz
+    
+    If a file with the same name exists, a numeric suffix is added:
+    bak.[directory_name].[YYYY-mm-dd].1.tgz
+
+AUTOMATIC SCRIPT EXECUTION:
+    If present, the following scripts are automatically executed:
+    
+    .bup-pre.sh        Executed before creating the backup tarball
+                       - Script runs in the target directory
+                       - If script fails, backup is aborted
+                       - Receives BUP_VERBOSE=1 environment variable in verbose mode
+    
+    .bup-post.sh       Executed after creating the backup tarball
+                       - Script runs in the target directory
+                       - If script fails, backup continues (warning issued)
+                       - Receives BUP_VERBOSE=1 environment variable in verbose mode
+
+ENVIRONMENT VARIABLES:
+    BUP_VERBOSE        Set to "1" when --verbose flag is used, available to
+                       .bup-pre.sh and .bup-post.sh scripts
+
+EXAMPLES:
+    $0 /home/user/project
+    $0 /home/user/project -o /backup/location
+    $0 /home/user/project --verbose
+    $0 /home/user/project -o /backup -v
+
+EOF
+}
+
+# Check for help flag first
+if [ $# -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
+    show_help
+    exit 0
+fi
+
+if [ $# -lt 1 ] || [ $# -gt 4 ]; then
+    echo "Usage: $0 <directory> [-o output_directory] [-v|--verbose] [-h|--help]"
+    echo "Use -h or --help for detailed information"
+    exit 1
+fi
+
+DIR="$1"
+OUTPUT_DIR=$(pwd)
+VERBOSE=false
+TAR_VERBOSE=""
+
+# Parse arguments
+shift
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            if [ $# -lt 2 ]; then
+                echo "Error: -o requires an output directory"
+                exit 1
+            fi
+            OUTPUT_DIR="$2"
+            if [ ! -d "$OUTPUT_DIR" ]; then
+                echo "Error: Output directory '$OUTPUT_DIR' does not exist"
+                exit 1
+            fi
+            OUTPUT_DIR=$(realpath "$OUTPUT_DIR")
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            TAR_VERBOSE="v"
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option $1"
+            echo "Use -h or --help for detailed information"
+            exit 1
+            ;;
+    esac
+done
+
+if [ ! -d "$DIR" ]; then
+    echo "Error: Directory '$DIR' does not exist"
+    exit 1
+fi
+
+DIR=$(realpath "$DIR")
+DIR_NAME=$(basename "$DIR")
+ORIGINAL_DIR=$(pwd)
+
+# Check for and run .bup-pre.sh if it exists
+if [ -f "$DIR/.bup-pre.sh" ]; then
+    echo "Running pre-backup script..."
+    if [ "$VERBOSE" = true ]; then
+        export BUP_VERBOSE=1
+    fi
+    cd "$DIR" && ./.bup-pre.sh
+    if [ $? -ne 0 ]; then
+        echo "Error: Pre-backup script failed"
+        exit 1
+    fi
+    cd "$ORIGINAL_DIR"
+    unset BUP_VERBOSE
+fi
+
+# Generate tarball name with date
+DATE=$(date +%Y-%m-%d)
+BASE_NAME="bak.${DIR_NAME}.${DATE}"
+TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.tgz"
+
+# Handle suffix if file already exists
+SUFFIX=1
+while [ -f "$TARBALL_NAME" ]; do
+    TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.tgz"
+    SUFFIX=$((SUFFIX + 1))
+done
+
+echo "Creating backup: $TARBALL_NAME"
+tar -cz${TAR_VERBOSE}f "$TARBALL_NAME" -C "$(dirname "$DIR")" "$(basename "$DIR")"
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to create tarball"
+    exit 1
+fi
+
+echo "Backup created successfully: $TARBALL_NAME"
+
+# Check for and run .bup-post.sh if it exists
+if [ -f "$DIR/.bup-post.sh" ]; then
+    echo "Running post-backup script..."
+    if [ "$VERBOSE" = true ]; then
+        export BUP_VERBOSE=1
+    fi
+    cd "$DIR" && ./.bup-post.sh
+    if [ $? -ne 0 ]; then
+        echo "Warning: Post-backup script failed"
+    fi
+    unset BUP_VERBOSE
+fi
