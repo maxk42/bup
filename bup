@@ -19,6 +19,10 @@ ARGUMENTS:
 OPTIONS:
     -o output_directory Specify alternative directory to store the tarball
                        (default: current directory)
+    -x, --exclude pattern
+                       Exclude files matching the given pattern (can be used
+                       multiple times). Patterns are passed to tar's --exclude
+    --exclude-vcs      Exclude version control system files (.git, .svn, etc.)
     -v, --verbose      Enable verbose output and set BUP_VERBOSE environment
                        variable for pre/post scripts
     -h, --help         Show this help message
@@ -52,6 +56,9 @@ EXAMPLES:
     $0 /home/user/project -o /backup/location
     $0 /home/user/project --verbose
     $0 /home/user/project -o /backup -v
+    $0 /home/user/project -x "*.log" -x "*.tmp"
+    $0 /home/user/project --exclude-vcs
+    $0 /home/user/project -x "node_modules" --exclude-vcs -o /backup
 
 EOF
 }
@@ -62,8 +69,8 @@ if [ $# -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
     exit 0
 fi
 
-if [ $# -lt 1 ] || [ $# -gt 4 ]; then
-    echo "Usage: $0 <directory> [-o output_directory] [-v|--verbose] [-h|--help]"
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <directory> [OPTIONS]"
     echo "Use -h or --help for detailed information"
     exit 1
 fi
@@ -72,6 +79,8 @@ DIR="$1"
 OUTPUT_DIR=$(pwd)
 VERBOSE=false
 TAR_VERBOSE=""
+EXCLUDE_PATTERNS=()
+EXCLUDE_VCS=false
 
 # Parse arguments
 shift
@@ -93,6 +102,18 @@ while [ $# -gt 0 ]; do
         -v|--verbose)
             VERBOSE=true
             TAR_VERBOSE="v"
+            shift
+            ;;
+        -x|--exclude)
+            if [ $# -lt 2 ]; then
+                echo "Error: -x/--exclude requires a pattern"
+                exit 1
+            fi
+            EXCLUDE_PATTERNS+=("$2")
+            shift 2
+            ;;
+        --exclude-vcs)
+            EXCLUDE_VCS=true
             shift
             ;;
         -h|--help)
@@ -144,7 +165,18 @@ while [ -f "$TARBALL_NAME" ]; do
 done
 
 echo "Creating backup: $TARBALL_NAME"
-tar -cz${TAR_VERBOSE}f "$TARBALL_NAME" -C "$(dirname "$DIR")" "$(basename "$DIR")"
+
+# Build exclusion arguments for tar
+TAR_EXCLUDE_ARGS=()
+for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+    TAR_EXCLUDE_ARGS+=("--exclude=$pattern")
+done
+
+if [ "$EXCLUDE_VCS" = true ]; then
+    TAR_EXCLUDE_ARGS+=("--exclude-vcs")
+fi
+
+tar -cz${TAR_VERBOSE}f "$TARBALL_NAME" "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")"
 if [ $? -ne 0 ]; then
     echo "Error: Failed to create tarball"
     exit 1

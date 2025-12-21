@@ -9,7 +9,10 @@ bup  [OPTIONS]
 ## OPTIONS
 - `-o output_directory` - Specify alternative directory to store the
 tarball (default: current directory)
-- `-v, --verbose` - Enable verbose output and set BUP_VERBOSE environment 
+- `-x, --exclude pattern` - Exclude files matching the given pattern (can be
+used multiple times). Patterns are passed to tar's --exclude
+- `--exclude-vcs` - Exclude version control system files (.git, .svn, etc.)
+- `-v, --verbose` - Enable verbose output and set BUP_VERBOSE environment
 variable for pre/post scripts
 - `-h, --help` - Show this help message
 
@@ -46,5 +49,8 @@ bup /home/user/project
 bup /home/user/project -o /backup/location
 bup /home/user/project --verbose
 bup /home/user/project -o /backup -v
+bup /home/user/project -x "*.log" -x "*.tmp"
+bup /home/user/project --exclude-vcs
+bup /home/user/project -x "node_modules" --exclude-vcs -o /backup
 
 
