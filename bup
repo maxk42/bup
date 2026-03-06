@@ -176,6 +176,14 @@ if [ "$EXCLUDE_VCS" = true ]; then
     TAR_EXCLUDE_ARGS+=("--exclude-vcs")
 fi
 
+# If the tarball would be created inside the directory being backed up, exclude it
+REAL_OUTPUT_DIR=$(realpath "$(dirname "$TARBALL_NAME")")
+if [[ "$REAL_OUTPUT_DIR" == "$DIR" || "$REAL_OUTPUT_DIR" == "$DIR"/* ]]; then
+    TARBALL_REL_PATH="${REAL_OUTPUT_DIR#"$DIR"}/"
+    TARBALL_REL_PATH="${TARBALL_REL_PATH#/}"
+    TAR_EXCLUDE_ARGS+=("--exclude=${DIR_NAME}/${TARBALL_REL_PATH}$(basename "$TARBALL_NAME")")
+fi
+
 tar -cz${TAR_VERBOSE}f "$TARBALL_NAME" "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")"
 if [ $? -ne 0 ]; then
     echo "Error: Failed to create tarball"
