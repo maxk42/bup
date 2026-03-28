@@ -1,0 +1,255 @@
+.TH BUP 1 "2026-03-27" "bup" "User Commands"
+.SH NAME
+bup \- create compressed tarball backups of directories
+.SH SYNOPSIS
+.B bup
+.IR directory ...
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B bup
+creates compressed tarball backups of one or more directories with
+automatic conflict-free naming, optional encryption, retention
+management, and pre/post script execution.
+.PP
+Tarballs are named
+.BR bak. \fIdirname\fR . \fIYYYY-mm-dd\fR .tgz
+and a numeric suffix is appended if a file with the same name already
+exists.
+.SH OPTIONS
+.TP
+.BI \-o " output_directory"
+Write the tarball to
+.I output_directory
+instead of the current directory.
+.TP
+.BI \-x " pattern" "\fR,\fP \-\-exclude " pattern
+Exclude files matching
+.IR pattern .
+Can be specified multiple times.
+Patterns are passed to
+.BR tar (1)'s
+.B \-\-exclude
+option.
+.TP
+.B \-\-exclude\-vcs
+Exclude version control system files (.git, .svn, etc.).
+Passed to
+.BR tar (1)
+as
+.BR \-\-exclude\-vcs .
+.TP
+.B \-\-exclude\-artifacts
+Exclude common build outputs, dependency directories, caches, and IDE
+files.
+See
+.B EXCLUSION PATTERNS
+below.
+.TP
+.B \-\-exclude\-secrets
+Exclude common secrets, credentials, private keys, and environment
+files.
+See
+.B EXCLUSION PATTERNS
+below.
+.TP
+.B \-\-exclude\-dev
+Shorthand for
+.B \-\-exclude\-artifacts \-\-exclude\-secrets\fR.
+.TP
+.B \-\-show\-excludes
+Print the full list of artifact and secret exclusion patterns and exit.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output.
+Sets the
+.B BUP_VERBOSE
+environment variable to
+.B 1
+for pre/post scripts and passes
+.B v
+to
+.BR tar (1).
+.TP
+.BR \-n ", " \-\-dry\-run
+Show what would happen without creating a backup or modifying any files.
+.TP
+.B \-\-combined
+When multiple directories are given, bundle them into a single tarball
+instead of creating one tarball per directory.
+The tarball is named
+.BR bak. \fIdir1\fR + \fIdir2\fR . \fIdate\fR .tgz .
+.TP
+.BI \-z " algo" "\fR,\fP \-\-compress " algo
+Choose the compression algorithm.
+.I algo
+must be one of
+.BR gzip " (default), " bzip2 ", " xz ", or " zstd .
+The file extension is set accordingly:
+.BR .tgz ", " .tbz2 ", " .txz ", " .tzst .
+.TP
+.BR \-e ", " \-\-encrypt
+Encrypt the tarball with
+.BR gpg (1)
+using symmetric encryption.
+The user is prompted for a passphrase.
+The output file has a
+.B .gpg
+suffix appended (e.g.,
+.BR .tgz.gpg ).
+.TP
+.BI \-\-recipient " KEY"
+Encrypt using asymmetric GPG encryption with
+.IR KEY .
+Implies
+.BR \-e .
+.TP
+.BI \-\-keep " N"
+After creating the backup, keep only the
+.I N
+most recent backups for the same directory in the output directory and
+delete the rest.
+.TP
+.BI \-\-prune " N"
+Standalone mode: delete old backups, keeping only the
+.I N
+most recent.
+No new backup is created.
+Requires at least one directory argument to identify which backups to
+prune.
+.TP
+.B \-\-list
+List existing backups in the output directory in a table showing date,
+size, and filename.
+If directories are specified, only backups for those directories are
+shown.
+.TP
+.BR \-L ", " \-\-list\-verbose
+Like
+.B \-\-list
+but also shows the file count inside each tarball.
+Encrypted tarballs display
+.B (encrypted)
+instead.
+.TP
+.BR \-s ", " \-\-save\-script
+Generate an executable shell script that re-runs
+.B bup
+with the same arguments (excluding script-generation flags).
+Defaults to
+.B ./backup.sh\fR.
+.TP
+.BI \-S " name" "\fR,\fP \-\-script\-name " name
+Use
+.I name
+instead of
+.BR backup.sh .
+Implies
+.BR \-s .
+.TP
+.BI \-d " directory" "\fR,\fP \-\-script\-dir " directory
+Write the generated script to
+.I directory
+instead of the current directory.
+Implies
+.BR \-s .
+.TP
+.BR \-V ", " \-\-version
+Show version number and exit.
+.TP
+.BR \-h ", " \-\-help
+Show built-in help and exit.
+.SH EXCLUSION PATTERNS
+.SS Artifact patterns (\-\-exclude\-artifacts)
+.B Dependency directories:
+node_modules, bower_components, vendor, .bundle, jspm_packages, packages
+.PP
+.B Build outputs:
+target, build, dist, out, bin, obj, _build, cmake-build-*, *.egg-info,
+__pycache__, *.pyc
+.PP
+.B Caches:
+\&.cache, .parcel-cache, .next, .nuxt, .turbo, .angular, .svelte-kit,
+\&.gradle, .sass-cache, .pytest_cache, .mypy_cache, .ruff_cache, .tox,
+\&.nox, .venv, venv, .eggs, .hypothesis, .coverage, htmlcov,
+\&.phpunit.cache, .jest-cache
+.PP
+.B IDE / editor:
+\&.idea, .vs, .vscode, *.swp, *.swo, *~, .DS_Store
+.PP
+.B Misc:
+artifacts, .terraform, .serverless, cdk.out, .aws-sam, .vagrant
+.SS Secret patterns (\-\-exclude\-secrets)
+.B Environment files:
+\&.env, .env.*, appsettings.json, appsettings.*.json, secrets.json,
+local.settings.json
+.PP
+.B Credentials / keys:
+*.pem, *.key, *.p12, *.pfx, *.jks, *.keystore, credentials.json,
+service-account*.json, *.gpg-key, .npmrc, .pypirc, .docker/config.json,
+\&.netrc, .htpasswd
+.PP
+.B Cloud / infrastructure:
+terraform.tfvars, *.tfvars, .aws/credentials
+.PP
+.B SSH keys:
+id_rsa, id_ed25519, id_ecdsa
+.SH AUTOMATIC SCRIPT EXECUTION
+If a file named
+.B .bup\-pre.sh
+exists in the target directory, it is executed before the backup.
+If the script fails (non-zero exit), the backup is aborted.
+.PP
+If a file named
+.B .bup\-post.sh
+exists in the target directory, it is executed after the backup.
+If the script fails, a warning is issued but the backup is retained.
+.PP
+Both scripts run with the target directory as the working directory and
+receive
+.B BUP_VERBOSE=1
+when verbose mode is enabled.
+.SH ENVIRONMENT
+.TP
+.B BUP_VERBOSE
+Set to
+.B 1
+when
+.B \-\-verbose
+is used.
+Available to .bup\-pre.sh and .bup\-post.sh scripts.
+.TP
+.B NO_COLOR
+Set to any value to disable colored output.
+See
+.UR https://no-color.org
+.UE .
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error occurred (invalid arguments, directory not found, tar failure,
+pre-script failure, etc.).
+.SH EXAMPLES
+.nf
+bup /home/user/project
+bup /home/user/project \-o /backup
+bup /home/user/project \-\-verbose
+bup /home/user/project \-x "*.log" \-x "*.tmp"
+bup /home/user/project \-\-exclude\-dev
+bup /home/user/projA /home/user/projB \-o /backup
+bup /home/user/projA /home/user/projB \-\-combined
+bup /home/user/project \-z xz \-e \-\-keep 5
+bup /home/user/project \-\-prune 3 \-o /backup
+bup \-\-list \-o /backup
+bup /home/user/project \-L \-o /backup
+bup /home/user/project \-s \-o /backup
+bup \-\-show\-excludes
+.fi
+.SH SEE ALSO
+.BR tar (1),
+.BR gpg (1),
+.BR test\-bup (1)
+.SH AUTHORS
+Written with assistance from Claude.

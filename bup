@@ -6,15 +6,17 @@
 # for a project.  (For example you could run `cargo clean` before
 # backup and `cargo build` after.)
 
+BUP_VERSION="0.4.2"
+
 show_help() {
     cat << EOF
 bup - Backup utility that creates gzipped tarballs of directories
 
 USAGE:
-    $0 <directory> [OPTIONS]
+    $0 <directory...> [OPTIONS]
 
 ARGUMENTS:
-    directory           Directory to backup
+    directory...        One or more directories to backup
 
 OPTIONS:
     -o output_directory Specify alternative directory to store the tarball
@@ -23,25 +25,55 @@ OPTIONS:
                        Exclude files matching the given pattern (can be used
                        multiple times). Patterns are passed to tar's --exclude
     --exclude-vcs      Exclude version control system files (.git, .svn, etc.)
+    --exclude-artifacts
+                       Exclude common build outputs, dependency directories,
+                       caches, and IDE files
+    --exclude-secrets  Exclude common secrets, credentials, private keys,
+                       and environment files
+    --exclude-dev      Exclude both artifacts and secrets (shorthand for
+                       --exclude-artifacts --exclude-secrets)
+    --show-excludes    Print all exclusion patterns and exit
     -v, --verbose      Enable verbose output and set BUP_VERBOSE environment
                        variable for pre/post scripts
+    -n, --dry-run      Show what would happen without creating a backup
+    --combined         Bundle multiple directories into a single tarball
+    -z, --compress algo
+                       Choose compression algorithm: gzip (default), bzip2,
+                       xz, zstd
+    -e, --encrypt      Encrypt tarball with GPG (symmetric, prompts for
+                       passphrase)
+    --recipient KEY    Use asymmetric GPG encryption with KEY (implies -e)
+    --keep N           After backup, keep only the N most recent backups per
+                       directory and delete the rest
+    --prune N          Standalone: delete old backups, keep N most recent
+                       (no new backup is created)
+    --list             List existing backups in the output directory
+    -L, --list-verbose List backups with detailed info (file count)
+    -s, --save-script  Generate an executable backup script that re-runs bup
+                       with the same arguments (default: ./backup.sh)
+    -S, --script-name name
+                       Use 'name' instead of backup.sh (implies --save-script)
+    -d, --script-dir directory
+                       Write the script to 'directory' instead of the current
+                       directory (implies --save-script)
+    -V, --version      Show version number and exit
     -h, --help         Show this help message
 
 DESCRIPTION:
     Creates a gzipped tarball of the specified directory with automatic naming:
     bak.[directory_name].[YYYY-mm-dd].tgz
-    
+
     If a file with the same name exists, a numeric suffix is added:
     bak.[directory_name].[YYYY-mm-dd].1.tgz
 
 AUTOMATIC SCRIPT EXECUTION:
     If present, the following scripts are automatically executed:
-    
+
     .bup-pre.sh        Executed before creating the backup tarball
                        - Script runs in the target directory
                        - If script fails, backup is aborted
                        - Receives BUP_VERBOSE=1 environment variable in verbose mode
-    
+
     .bup-post.sh       Executed after creating the backup tarball
                        - Script runs in the target directory
                        - If script fails, backup continues (warning issued)
@@ -50,6 +82,7 @@ AUTOMATIC SCRIPT EXECUTION:
 ENVIRONMENT VARIABLES:
     BUP_VERBOSE        Set to "1" when --verbose flag is used, available to
                        .bup-pre.sh and .bup-post.sh scripts
+    NO_COLOR           Set to any value to disable colored output
 
 EXAMPLES:
     $0 /home/user/project
@@ -59,148 +92,798 @@ EXAMPLES:
     $0 /home/user/project -x "*.log" -x "*.tmp"
     $0 /home/user/project --exclude-vcs
     $0 /home/user/project -x "node_modules" --exclude-vcs -o /backup
+    $0 /home/user/project -o /backup -s
+    $0 /home/user/project -o /backup -S my-backup.sh
+    $0 /home/user/project -o /backup -s -d /usr/local/bin
+    $0 /home/user/project -n
+    $0 /home/user/projA /home/user/projB -o /backup
+    $0 /home/user/projA /home/user/projB --combined -o /backup
+    $0 /home/user/project -z xz -o /backup
+    $0 /home/user/project -z zstd --exclude-vcs
+    $0 /home/user/project -e
+    $0 /home/user/project -e --recipient alice@example.com
+    $0 /home/user/project --keep 5 -o /backup
+    $0 /home/user/project --prune 3 -o /backup
+    $0 --list -o /backup
+    $0 /home/user/project --list -o /backup
+    $0 /home/user/project -L -o /backup
+    $0 /home/user/project --exclude-artifacts
+    $0 /home/user/project --exclude-dev -o /backup
+    $0 --show-excludes
 
 EOF
 }
 
-# Check for help flag first
-if [ $# -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
-    show_help
-    exit 0
+# --- Color support ---
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[0;31m'
+    C_GREEN=$'\033[0;32m'
+    C_YELLOW=$'\033[1;33m'
+    C_CYAN=$'\033[0;36m'
+    C_BOLD=$'\033[1m'
+    C_RESET=$'\033[0m'
+else
+    C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_BOLD="" C_RESET=""
 fi
 
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <directory> [OPTIONS]"
-    echo "Use -h or --help for detailed information"
-    exit 1
-fi
+msg_ok()   { echo "${C_GREEN}$*${C_RESET}"; }
+msg_err()  { echo "${C_RED}Error: $*${C_RESET}" >&2; }
+msg_warn() { echo "${C_YELLOW}Warning: $*${C_RESET}" >&2; }
+msg_info() { echo "${C_CYAN}$*${C_RESET}"; }
 
-DIR="$1"
+# --- Exclusion pattern lists ---
+
+ARTIFACT_PATTERNS=(
+    # Dependency directories
+    "node_modules" "bower_components" "vendor" ".bundle" "jspm_packages" "packages"
+    # Build output directories
+    "target" "build" "dist" "out" "bin" "obj" "_build" "cmake-build-*"
+    "*.egg-info" "__pycache__" "*.pyc"
+    # Cache / temp directories
+    ".cache" ".parcel-cache" ".next" ".nuxt" ".turbo" ".angular" ".svelte-kit"
+    ".gradle" ".sass-cache" ".pytest_cache" ".mypy_cache" ".ruff_cache"
+    ".tox" ".nox" ".venv" "venv" ".eggs" ".hypothesis"
+    ".coverage" "htmlcov" ".phpunit.cache" ".jest-cache"
+    # IDE / editor artifacts
+    ".idea" ".vs" ".vscode" "*.swp" "*.swo" "*~" ".DS_Store"
+    # Misc artifacts
+    "artifacts" ".terraform" ".serverless" "cdk.out" ".aws-sam" ".vagrant"
+)
+
+SECRET_PATTERNS=(
+    # Environment / config files
+    ".env" ".env.*" "appsettings.json" "appsettings.*.json"
+    "secrets.json" "local.settings.json"
+    # Credential / key files
+    "*.pem" "*.key" "*.p12" "*.pfx" "*.jks" "*.keystore"
+    "credentials.json" "service-account*.json" "*.gpg-key"
+    ".npmrc" ".pypirc" ".docker/config.json" ".netrc" ".htpasswd"
+    # Cloud / infrastructure secrets
+    "terraform.tfvars" "*.tfvars" ".aws/credentials"
+    # SSH private keys
+    "id_rsa" "id_ed25519" "id_ecdsa"
+)
+
+# --- Utility functions ---
+
+do_retention() {
+    local dir_name="$1" output_dir="$2" keep="$3"
+    local -a found=()
+    while IFS= read -r f; do
+        [ -n "$f" ] && found+=("$f")
+    done < <(ls -1t "$output_dir"/bak."$dir_name".*.tgz "$output_dir"/bak."$dir_name".*.tgz.gpg \
+                    "$output_dir"/bak."$dir_name".*.tbz2 "$output_dir"/bak."$dir_name".*.tbz2.gpg \
+                    "$output_dir"/bak."$dir_name".*.txz "$output_dir"/bak."$dir_name".*.txz.gpg \
+                    "$output_dir"/bak."$dir_name".*.tzst "$output_dir"/bak."$dir_name".*.tzst.gpg \
+                    2>/dev/null)
+
+    if [ ${#found[@]} -le "$keep" ]; then
+        return
+    fi
+
+    local i
+    for (( i=keep; i<${#found[@]}; i++ )); do
+        if [ "$DRY_RUN" = true ]; then
+            msg_info "[dry-run] Would delete: ${found[$i]}"
+        else
+            rm -f "${found[$i]}"
+            msg_info "Deleted old backup: ${found[$i]}"
+        fi
+    done
+}
+
+do_list() {
+    local output_dir="$1" verbose="$2"
+    shift 2
+    local -a dir_names=("$@")
+
+    local -a files=()
+    if [ ${#dir_names[@]} -gt 0 ]; then
+        for dn in "${dir_names[@]}"; do
+            while IFS= read -r f; do
+                [ -n "$f" ] && files+=("$f")
+            done < <(ls -1t "$output_dir"/bak."$dn".*.tgz "$output_dir"/bak."$dn".*.tgz.gpg \
+                            "$output_dir"/bak."$dn".*.tbz2 "$output_dir"/bak."$dn".*.tbz2.gpg \
+                            "$output_dir"/bak."$dn".*.txz "$output_dir"/bak."$dn".*.txz.gpg \
+                            "$output_dir"/bak."$dn".*.tzst "$output_dir"/bak."$dn".*.tzst.gpg \
+                            2>/dev/null)
+        done
+    else
+        while IFS= read -r f; do
+            [ -n "$f" ] && files+=("$f")
+        done < <(ls -1t "$output_dir"/bak.*.tgz "$output_dir"/bak.*.tgz.gpg \
+                        "$output_dir"/bak.*.tbz2 "$output_dir"/bak.*.tbz2.gpg \
+                        "$output_dir"/bak.*.txz "$output_dir"/bak.*.txz.gpg \
+                        "$output_dir"/bak.*.tzst "$output_dir"/bak.*.tzst.gpg \
+                        2>/dev/null)
+    fi
+
+    if [ ${#files[@]} -eq 0 ]; then
+        msg_info "No backups found."
+        return
+    fi
+
+    if [ "$verbose" = true ]; then
+        printf "${C_BOLD}%-12s  %8s  %8s  %s${C_RESET}\n" "DATE" "SIZE" "FILES" "FILENAME"
+    else
+        printf "${C_BOLD}%-12s  %8s  %s${C_RESET}\n" "DATE" "SIZE" "FILENAME"
+    fi
+
+    for f in "${files[@]}"; do
+        local fname fdate fsize
+        fname=$(basename "$f")
+        # Extract date from filename: bak.NAME.YYYY-mm-dd[.N].ext
+        fdate=$(echo "$fname" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+        [ -z "$fdate" ] && fdate="unknown"
+        fsize=$(du -h "$f" | cut -f1 | xargs)
+        if [ "$verbose" = true ]; then
+            local fcount
+            if [[ "$fname" == *.gpg ]]; then
+                fcount="(encrypted)"
+            else
+                fcount=$(tar -tf "$f" 2>/dev/null | wc -l | xargs)
+            fi
+            printf "%-12s  %8s  %8s  %s\n" "$fdate" "$fsize" "$fcount" "$fname"
+        else
+            printf "%-12s  %8s  %s\n" "$fdate" "$fsize" "$fname"
+        fi
+    done
+}
+
+do_backup() {
+    local DIR="$1"
+    DIR=$(realpath "$DIR")
+    local DIR_NAME
+    DIR_NAME=$(basename "$DIR")
+    local ORIGINAL_DIR
+    ORIGINAL_DIR=$(pwd)
+
+    # Check for and run .bup-pre.sh if it exists
+    if [ -f "$DIR/.bup-pre.sh" ]; then
+        if [ "$DRY_RUN" = true ]; then
+            msg_info "[dry-run] Would run pre-backup script: $DIR/.bup-pre.sh"
+        else
+            msg_info "Running pre-backup script..."
+            if [ "$VERBOSE" = true ]; then
+                export BUP_VERBOSE=1
+            fi
+            cd "$DIR" && ./.bup-pre.sh
+            if [ $? -ne 0 ]; then
+                msg_err "Pre-backup script failed"
+                cd "$ORIGINAL_DIR"
+                return 1
+            fi
+            cd "$ORIGINAL_DIR"
+            unset BUP_VERBOSE
+        fi
+    fi
+
+    # Generate tarball name with date
+    local DATE BASE_NAME TARBALL_NAME
+    DATE=$(date +%Y-%m-%d)
+    BASE_NAME="bak.${DIR_NAME}.${DATE}"
+    TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${FILE_EXT}"
+    if [ "$ENCRYPT" = true ]; then
+        TARBALL_NAME="${TARBALL_NAME}.gpg"
+    fi
+
+    # Handle suffix if file already exists
+    local SUFFIX=1
+    while [ -f "$TARBALL_NAME" ]; do
+        if [ "$ENCRYPT" = true ]; then
+            TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.${FILE_EXT}.gpg"
+        else
+            TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.${FILE_EXT}"
+        fi
+        SUFFIX=$((SUFFIX + 1))
+    done
+
+    # Build exclusion arguments for tar
+    local -a TAR_EXCLUDE_ARGS=()
+    local pattern
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        TAR_EXCLUDE_ARGS+=("--exclude=$pattern")
+    done
+
+    if [ "$EXCLUDE_VCS" = true ]; then
+        TAR_EXCLUDE_ARGS+=("--exclude-vcs")
+    fi
+
+    # If the tarball would be created inside the directory being backed up, exclude it
+    local REAL_OUTPUT_DIR
+    REAL_OUTPUT_DIR=$(realpath "$(dirname "$TARBALL_NAME")")
+    if [[ "$REAL_OUTPUT_DIR" == "$DIR" || "$REAL_OUTPUT_DIR" == "$DIR"/* ]]; then
+        local TARBALL_REL_PATH="${REAL_OUTPUT_DIR#"$DIR"}/"
+        TARBALL_REL_PATH="${TARBALL_REL_PATH#/}"
+        TAR_EXCLUDE_ARGS+=("--exclude=${DIR_NAME}/${TARBALL_REL_PATH}$(basename "$TARBALL_NAME")")
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        msg_info "[dry-run] Would create: $TARBALL_NAME"
+        msg_info "[dry-run] Compression: $COMPRESS_ALGO"
+        [ ${#TAR_EXCLUDE_ARGS[@]} -gt 0 ] && msg_info "[dry-run] Excludes: ${TAR_EXCLUDE_ARGS[*]}"
+        if [ "$ENCRYPT" = true ]; then
+            if [ -n "$GPG_RECIPIENT" ]; then
+                msg_info "[dry-run] Encryption: asymmetric (recipient: $GPG_RECIPIENT)"
+            else
+                msg_info "[dry-run] Encryption: symmetric"
+            fi
+        fi
+    else
+        msg_info "Creating backup: $TARBALL_NAME"
+
+        # Atomic write: tar to temp file, then mv
+        local TEMP_FILE
+        TEMP_FILE=$(mktemp "${OUTPUT_DIR}/.bup-tmp.XXXXXX")
+        trap 'rm -f "$TEMP_FILE"' EXIT
+
+        local tar_status
+        if [ "$ENCRYPT" = true ]; then
+            # Pipe through gpg for encryption
+            local -a gpg_args=()
+            if [ -n "$GPG_RECIPIENT" ]; then
+                gpg_args=(--encrypt --recipient "$GPG_RECIPIENT")
+            else
+                gpg_args=(--symmetric)
+            fi
+            if [ "$COMPRESS_ALGO" = "zstd" ]; then
+                tar --zstd -c${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")" \
+                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
+                tar_status=${PIPESTATUS[0]}
+            else
+                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")" \
+                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
+                tar_status=${PIPESTATUS[0]}
+            fi
+        else
+            if [ "$COMPRESS_ALGO" = "zstd" ]; then
+                tar --zstd -c${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")"
+                tar_status=$?
+            else
+                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")"
+                tar_status=$?
+            fi
+        fi
+
+        if [ "$tar_status" -ne 0 ]; then
+            rm -f "$TEMP_FILE"
+            trap - EXIT
+            msg_err "Failed to create tarball"
+            return 1
+        fi
+
+        mv "$TEMP_FILE" "$TARBALL_NAME"
+        trap - EXIT
+
+        msg_ok "Backup created successfully: $TARBALL_NAME"
+
+        # Report backup size
+        local FSIZE
+        FSIZE=$(du -h "$TARBALL_NAME" | cut -f1 | xargs)
+        msg_info "Backup size: ${FSIZE}"
+    fi
+
+    # Check for and run .bup-post.sh if it exists
+    if [ -f "$DIR/.bup-post.sh" ]; then
+        if [ "$DRY_RUN" = true ]; then
+            msg_info "[dry-run] Would run post-backup script: $DIR/.bup-post.sh"
+        else
+            msg_info "Running post-backup script..."
+            if [ "$VERBOSE" = true ]; then
+                export BUP_VERBOSE=1
+            fi
+            cd "$DIR" && ./.bup-post.sh
+            if [ $? -ne 0 ]; then
+                msg_warn "Post-backup script failed"
+            fi
+            cd "$ORIGINAL_DIR"
+            unset BUP_VERBOSE
+        fi
+    fi
+
+    # Inline retention
+    if [ "$KEEP_COUNT" -gt 0 ]; then
+        do_retention "$DIR_NAME" "$OUTPUT_DIR" "$KEEP_COUNT"
+    fi
+}
+
+do_combined_backup() {
+    local ORIGINAL_DIR
+    ORIGINAL_DIR=$(pwd)
+
+    # Build combined name from directory basenames
+    local -a dir_basenames=()
+    local dir
+    for dir in "${DIRS[@]}"; do
+        dir=$(realpath "$dir")
+        dir_basenames+=("$(basename "$dir")")
+    done
+    local COMBINED_NAME
+    COMBINED_NAME=$(IFS=+; echo "${dir_basenames[*]}")
+    # Truncate if too long (keep under 200 chars)
+    if [ ${#COMBINED_NAME} -gt 200 ]; then
+        COMBINED_NAME="${COMBINED_NAME:0:197}..."
+    fi
+
+    # Run pre-backup scripts for all dirs
+    for dir in "${DIRS[@]}"; do
+        dir=$(realpath "$dir")
+        if [ -f "$dir/.bup-pre.sh" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                msg_info "[dry-run] Would run pre-backup script: $dir/.bup-pre.sh"
+            else
+                msg_info "Running pre-backup script for $(basename "$dir")..."
+                if [ "$VERBOSE" = true ]; then
+                    export BUP_VERBOSE=1
+                fi
+                cd "$dir" && ./.bup-pre.sh
+                if [ $? -ne 0 ]; then
+                    msg_err "Pre-backup script failed for $(basename "$dir")"
+                    cd "$ORIGINAL_DIR"
+                    return 1
+                fi
+                cd "$ORIGINAL_DIR"
+                unset BUP_VERBOSE
+            fi
+        fi
+    done
+
+    # Generate tarball name
+    local DATE BASE_NAME TARBALL_NAME
+    DATE=$(date +%Y-%m-%d)
+    BASE_NAME="bak.${COMBINED_NAME}.${DATE}"
+    TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${FILE_EXT}"
+    if [ "$ENCRYPT" = true ]; then
+        TARBALL_NAME="${TARBALL_NAME}.gpg"
+    fi
+
+    local SUFFIX=1
+    while [ -f "$TARBALL_NAME" ]; do
+        if [ "$ENCRYPT" = true ]; then
+            TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.${FILE_EXT}.gpg"
+        else
+            TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.${FILE_EXT}"
+        fi
+        SUFFIX=$((SUFFIX + 1))
+    done
+
+    # Build exclusion arguments
+    local -a TAR_EXCLUDE_ARGS=()
+    local pattern
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        TAR_EXCLUDE_ARGS+=("--exclude=$pattern")
+    done
+    if [ "$EXCLUDE_VCS" = true ]; then
+        TAR_EXCLUDE_ARGS+=("--exclude-vcs")
+    fi
+
+    # Build tar source arguments: -C parent1 dir1 -C parent2 dir2 ...
+    local -a TAR_SRC_ARGS=()
+    for dir in "${DIRS[@]}"; do
+        dir=$(realpath "$dir")
+        TAR_SRC_ARGS+=(-C "$(dirname "$dir")" "$(basename "$dir")")
+    done
+
+    if [ "$DRY_RUN" = true ]; then
+        msg_info "[dry-run] Would create combined backup: $TARBALL_NAME"
+        msg_info "[dry-run] Directories: ${DIRS[*]}"
+        msg_info "[dry-run] Compression: $COMPRESS_ALGO"
+        [ ${#TAR_EXCLUDE_ARGS[@]} -gt 0 ] && msg_info "[dry-run] Excludes: ${TAR_EXCLUDE_ARGS[*]}"
+        if [ "$ENCRYPT" = true ]; then
+            if [ -n "$GPG_RECIPIENT" ]; then
+                msg_info "[dry-run] Encryption: asymmetric (recipient: $GPG_RECIPIENT)"
+            else
+                msg_info "[dry-run] Encryption: symmetric"
+            fi
+        fi
+    else
+        msg_info "Creating combined backup: $TARBALL_NAME"
+
+        local TEMP_FILE
+        TEMP_FILE=$(mktemp "${OUTPUT_DIR}/.bup-tmp.XXXXXX")
+        trap 'rm -f "$TEMP_FILE"' EXIT
+
+        local tar_status
+        if [ "$ENCRYPT" = true ]; then
+            local -a gpg_args=()
+            if [ -n "$GPG_RECIPIENT" ]; then
+                gpg_args=(--encrypt --recipient "$GPG_RECIPIENT")
+            else
+                gpg_args=(--symmetric)
+            fi
+            if [ "$COMPRESS_ALGO" = "zstd" ]; then
+                tar --zstd -c${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}" \
+                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
+                tar_status=${PIPESTATUS[0]}
+            else
+                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}" \
+                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
+                tar_status=${PIPESTATUS[0]}
+            fi
+        else
+            if [ "$COMPRESS_ALGO" = "zstd" ]; then
+                tar --zstd -c${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}"
+                tar_status=$?
+            else
+                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}"
+                tar_status=$?
+            fi
+        fi
+
+        if [ "$tar_status" -ne 0 ]; then
+            rm -f "$TEMP_FILE"
+            trap - EXIT
+            msg_err "Failed to create tarball"
+            return 1
+        fi
+
+        mv "$TEMP_FILE" "$TARBALL_NAME"
+        trap - EXIT
+
+        msg_ok "Backup created successfully: $TARBALL_NAME"
+
+        local FSIZE
+        FSIZE=$(du -h "$TARBALL_NAME" | cut -f1 | xargs)
+        msg_info "Backup size: ${FSIZE}"
+    fi
+
+    # Run post-backup scripts for all dirs
+    for dir in "${DIRS[@]}"; do
+        dir=$(realpath "$dir")
+        if [ -f "$dir/.bup-post.sh" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                msg_info "[dry-run] Would run post-backup script: $dir/.bup-post.sh"
+            else
+                msg_info "Running post-backup script for $(basename "$dir")..."
+                if [ "$VERBOSE" = true ]; then
+                    export BUP_VERBOSE=1
+                fi
+                cd "$dir" && ./.bup-post.sh
+                if [ $? -ne 0 ]; then
+                    msg_warn "Post-backup script failed for $(basename "$dir")"
+                fi
+                cd "$ORIGINAL_DIR"
+                unset BUP_VERBOSE
+            fi
+        fi
+    done
+}
+
+# --- Check for help/version flags ---
+for arg in "$@"; do
+    if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+        show_help
+        exit 0
+    fi
+    if [ "$arg" = "-V" ] || [ "$arg" = "--version" ]; then
+        echo "bup $BUP_VERSION"
+        exit 0
+    fi
+done
+
+# --- Variable initialization ---
 OUTPUT_DIR=$(pwd)
 VERBOSE=false
 TAR_VERBOSE=""
 EXCLUDE_PATTERNS=()
 EXCLUDE_VCS=false
+SAVE_SCRIPT=false
+SCRIPT_NAME="backup.sh"
+SCRIPT_DIR=$(pwd)
+SCRIPT_ARGS=()
+DRY_RUN=false
+DIRS=()
+COMBINED=false
+COMPRESS_ALGO="gzip"
+TAR_COMPRESS_FLAG="z"
+FILE_EXT="tgz"
+ENCRYPT=false
+GPG_RECIPIENT=""
+KEEP_COUNT=0
+PRUNE_ONLY=false
+PRUNE_COUNT=0
+LIST_MODE=false
+LIST_VERBOSE=false
+EXCLUDE_ARTIFACTS=false
+EXCLUDE_SECRETS=false
+SHOW_EXCLUDES=false
 
-# Parse arguments
-shift
+# --- Parse arguments ---
 while [ $# -gt 0 ]; do
     case $1 in
         -o)
             if [ $# -lt 2 ]; then
-                echo "Error: -o requires an output directory"
+                msg_err "-o requires an output directory"
                 exit 1
             fi
             OUTPUT_DIR="$2"
             if [ ! -d "$OUTPUT_DIR" ]; then
-                echo "Error: Output directory '$OUTPUT_DIR' does not exist"
+                msg_err "Output directory '$OUTPUT_DIR' does not exist"
                 exit 1
             fi
             OUTPUT_DIR=$(realpath "$OUTPUT_DIR")
+            SCRIPT_ARGS+=("-o" "$2")
             shift 2
             ;;
         -v|--verbose)
             VERBOSE=true
             TAR_VERBOSE="v"
+            SCRIPT_ARGS+=("$1")
             shift
             ;;
         -x|--exclude)
             if [ $# -lt 2 ]; then
-                echo "Error: -x/--exclude requires a pattern"
+                msg_err "-x/--exclude requires a pattern"
                 exit 1
             fi
             EXCLUDE_PATTERNS+=("$2")
+            SCRIPT_ARGS+=("$1" "$2")
             shift 2
             ;;
         --exclude-vcs)
             EXCLUDE_VCS=true
+            SCRIPT_ARGS+=("$1")
             shift
+            ;;
+        --exclude-artifacts)
+            EXCLUDE_ARTIFACTS=true
+            SCRIPT_ARGS+=("$1")
+            shift
+            ;;
+        --exclude-secrets)
+            EXCLUDE_SECRETS=true
+            SCRIPT_ARGS+=("$1")
+            shift
+            ;;
+        --exclude-dev)
+            EXCLUDE_ARTIFACTS=true
+            EXCLUDE_SECRETS=true
+            SCRIPT_ARGS+=("$1")
+            shift
+            ;;
+        --show-excludes)
+            SHOW_EXCLUDES=true
+            shift
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --combined)
+            COMBINED=true
+            SCRIPT_ARGS+=("$1")
+            shift
+            ;;
+        -z|--compress)
+            if [ $# -lt 2 ]; then
+                msg_err "-z/--compress requires an algorithm"
+                exit 1
+            fi
+            COMPRESS_ALGO="$2"
+            SCRIPT_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        -e|--encrypt)
+            ENCRYPT=true
+            SCRIPT_ARGS+=("$1")
+            shift
+            ;;
+        --recipient)
+            if [ $# -lt 2 ]; then
+                msg_err "--recipient requires a key ID"
+                exit 1
+            fi
+            ENCRYPT=true
+            GPG_RECIPIENT="$2"
+            SCRIPT_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --keep)
+            if [ $# -lt 2 ]; then
+                msg_err "--keep requires a number"
+                exit 1
+            fi
+            KEEP_COUNT="$2"
+            SCRIPT_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --prune)
+            if [ $# -lt 2 ]; then
+                msg_err "--prune requires a number"
+                exit 1
+            fi
+            PRUNE_ONLY=true
+            PRUNE_COUNT="$2"
+            shift 2
+            ;;
+        --list)
+            LIST_MODE=true
+            shift
+            ;;
+        -L|--list-verbose)
+            LIST_MODE=true
+            LIST_VERBOSE=true
+            shift
+            ;;
+        -s|--save-script)
+            SAVE_SCRIPT=true
+            shift
+            ;;
+        -S|--script-name)
+            if [ $# -lt 2 ]; then
+                msg_err "-S/--script-name requires a filename"
+                exit 1
+            fi
+            SAVE_SCRIPT=true
+            SCRIPT_NAME="$2"
+            shift 2
+            ;;
+        -d|--script-dir)
+            if [ $# -lt 2 ]; then
+                msg_err "-d/--script-dir requires a directory"
+                exit 1
+            fi
+            SAVE_SCRIPT=true
+            SCRIPT_DIR="$2"
+            if [ ! -d "$SCRIPT_DIR" ]; then
+                msg_err "Script directory '$SCRIPT_DIR' does not exist"
+                exit 1
+            fi
+            SCRIPT_DIR=$(realpath "$SCRIPT_DIR")
+            shift 2
+            ;;
+        -V|--version)
+            echo "bup $BUP_VERSION"
+            exit 0
             ;;
         -h|--help)
             show_help
             exit 0
             ;;
-        *)
-            echo "Error: Unknown option $1"
+        -*)
+            msg_err "Unknown option $1"
             echo "Use -h or --help for detailed information"
             exit 1
+            ;;
+        *)
+            DIRS+=("$1")
+            SCRIPT_ARGS+=("$1")
+            shift
             ;;
     esac
 done
 
-if [ ! -d "$DIR" ]; then
-    echo "Error: Directory '$DIR' does not exist"
-    exit 1
+# --- Post-parse validation ---
+
+# Compression algorithm
+case "$COMPRESS_ALGO" in
+    gzip)  TAR_COMPRESS_FLAG="z"; FILE_EXT="tgz" ;;
+    bzip2) TAR_COMPRESS_FLAG="j"; FILE_EXT="tbz2"
+           [ "$DRY_RUN" = false ] && { command -v bzip2 >/dev/null 2>&1 || { msg_err "bzip2 not found"; exit 1; }; } ;;
+    xz)    TAR_COMPRESS_FLAG="J"; FILE_EXT="txz"
+           [ "$DRY_RUN" = false ] && { command -v xz >/dev/null 2>&1 || { msg_err "xz not found"; exit 1; }; } ;;
+    zstd)  TAR_COMPRESS_FLAG=""; FILE_EXT="tzst"
+           [ "$DRY_RUN" = false ] && { command -v zstd >/dev/null 2>&1 || { msg_err "zstd not found"; exit 1; }; } ;;
+    *)     msg_err "Unknown compression algorithm: $COMPRESS_ALGO (choose gzip, bzip2, xz, zstd)"; exit 1 ;;
+esac
+
+# GPG check (skip in dry-run mode)
+if [ "$ENCRYPT" = true ] && [ "$DRY_RUN" = false ]; then
+    command -v gpg >/dev/null 2>&1 || { msg_err "gpg is required for encryption but not found"; exit 1; }
 fi
 
-DIR=$(realpath "$DIR")
-DIR_NAME=$(basename "$DIR")
-ORIGINAL_DIR=$(pwd)
+# Merge artifact/secret patterns into EXCLUDE_PATTERNS
+if [ "$EXCLUDE_ARTIFACTS" = true ]; then
+    EXCLUDE_PATTERNS+=("${ARTIFACT_PATTERNS[@]}")
+fi
+if [ "$EXCLUDE_SECRETS" = true ]; then
+    EXCLUDE_PATTERNS+=("${SECRET_PATTERNS[@]}")
+fi
 
-# Check for and run .bup-pre.sh if it exists
-if [ -f "$DIR/.bup-pre.sh" ]; then
-    echo "Running pre-backup script..."
-    if [ "$VERBOSE" = true ]; then
-        export BUP_VERBOSE=1
-    fi
-    cd "$DIR" && ./.bup-pre.sh
-    if [ $? -ne 0 ]; then
-        echo "Error: Pre-backup script failed"
+# --- Standalone modes (early exit) ---
+
+# Show excludes mode
+if [ "$SHOW_EXCLUDES" = true ]; then
+    echo "${C_BOLD}Artifact patterns (--exclude-artifacts):${C_RESET}"
+    for p in "${ARTIFACT_PATTERNS[@]}"; do echo "  $p"; done
+    echo ""
+    echo "${C_BOLD}Secret patterns (--exclude-secrets):${C_RESET}"
+    for p in "${SECRET_PATTERNS[@]}"; do echo "  $p"; done
+    exit 0
+fi
+
+# List mode
+if [ "$LIST_MODE" = true ]; then
+    local_dir_names=()
+    for dir in "${DIRS[@]}"; do
+        if [ ! -d "$dir" ]; then
+            msg_err "Directory '$dir' does not exist"
+            exit 1
+        fi
+        local_dir_names+=("$(basename "$(realpath "$dir")")")
+    done
+    do_list "$OUTPUT_DIR" "$LIST_VERBOSE" "${local_dir_names[@]}"
+    exit 0
+fi
+
+# Prune mode
+if [ "$PRUNE_ONLY" = true ]; then
+    if [ ${#DIRS[@]} -eq 0 ]; then
+        msg_err "At least one directory is required for --prune"
         exit 1
     fi
-    cd "$ORIGINAL_DIR"
-    unset BUP_VERBOSE
+    for dir in "${DIRS[@]}"; do
+        if [ ! -d "$dir" ]; then
+            msg_err "Directory '$dir' does not exist"
+            exit 1
+        fi
+        dir=$(realpath "$dir")
+        do_retention "$(basename "$dir")" "$OUTPUT_DIR" "$PRUNE_COUNT"
+    done
+    exit 0
 fi
 
-# Generate tarball name with date
-DATE=$(date +%Y-%m-%d)
-BASE_NAME="bak.${DIR_NAME}.${DATE}"
-TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.tgz"
-
-# Handle suffix if file already exists
-SUFFIX=1
-while [ -f "$TARBALL_NAME" ]; do
-    TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.tgz"
-    SUFFIX=$((SUFFIX + 1))
-done
-
-echo "Creating backup: $TARBALL_NAME"
-
-# Build exclusion arguments for tar
-TAR_EXCLUDE_ARGS=()
-for pattern in "${EXCLUDE_PATTERNS[@]}"; do
-    TAR_EXCLUDE_ARGS+=("--exclude=$pattern")
-done
-
-if [ "$EXCLUDE_VCS" = true ]; then
-    TAR_EXCLUDE_ARGS+=("--exclude-vcs")
-fi
-
-# If the tarball would be created inside the directory being backed up, exclude it
-REAL_OUTPUT_DIR=$(realpath "$(dirname "$TARBALL_NAME")")
-if [[ "$REAL_OUTPUT_DIR" == "$DIR" || "$REAL_OUTPUT_DIR" == "$DIR"/* ]]; then
-    TARBALL_REL_PATH="${REAL_OUTPUT_DIR#"$DIR"}/"
-    TARBALL_REL_PATH="${TARBALL_REL_PATH#/}"
-    TAR_EXCLUDE_ARGS+=("--exclude=${DIR_NAME}/${TARBALL_REL_PATH}$(basename "$TARBALL_NAME")")
-fi
-
-tar -cz${TAR_VERBOSE}f "$TARBALL_NAME" "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")"
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to create tarball"
+# --- Validate directories ---
+if [ ${#DIRS[@]} -eq 0 ]; then
+    msg_err "At least one directory is required"
+    echo "Usage: $0 <directory...> [OPTIONS]"
+    echo "Use -h or --help for detailed information"
     exit 1
 fi
 
-echo "Backup created successfully: $TARBALL_NAME"
+for dir in "${DIRS[@]}"; do
+    if [ ! -d "$dir" ]; then
+        msg_err "Directory '$dir' does not exist"
+        exit 1
+    fi
+done
 
-# Check for and run .bup-post.sh if it exists
-if [ -f "$DIR/.bup-post.sh" ]; then
-    echo "Running post-backup script..."
-    if [ "$VERBOSE" = true ]; then
-        export BUP_VERBOSE=1
+# --- Generate backup script if requested ---
+if [ "$SAVE_SCRIPT" = true ]; then
+    if [ "$DRY_RUN" = true ]; then
+        msg_info "[dry-run] Would save script: ${SCRIPT_DIR}/${SCRIPT_NAME}"
+    else
+        BUP_PATH=$(realpath "$0")
+        SCRIPT_FILE="${SCRIPT_DIR}/${SCRIPT_NAME}"
+        {
+            echo "#!/bin/bash"
+            echo "# Generated by bup on $(date +%Y-%m-%d)"
+            printf '%q' "$BUP_PATH"
+            for arg in "${SCRIPT_ARGS[@]}"; do
+                printf ' %q' "$arg"
+            done
+            echo
+        } > "$SCRIPT_FILE"
+        chmod +x "$SCRIPT_FILE"
+        msg_ok "Script saved: $SCRIPT_FILE"
     fi
-    cd "$DIR" && ./.bup-post.sh
-    if [ $? -ne 0 ]; then
-        echo "Warning: Post-backup script failed"
-    fi
-    unset BUP_VERBOSE
+fi
+
+# --- Run backups ---
+if [ "$COMBINED" = true ]; then
+    do_combined_backup
+else
+    for dir in "${DIRS[@]}"; do
+        do_backup "$dir"
+    done
 fi

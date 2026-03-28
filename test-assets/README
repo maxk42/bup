@@ -1,0 +1,2 @@
+This directory contains static test fixtures used by test-bup.
+Do not modify these files — the test suite depends on their exact contents.

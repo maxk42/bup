@@ -1,0 +1,203 @@
+.TH TEST\-BUP 1 "2026-03-27" "bup" "User Commands"
+.SH NAME
+test\-bup \- comprehensive test suite for the bup backup utility
+.SH SYNOPSIS
+.B test\-bup
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B test\-bup
+runs a comprehensive suite of automated tests covering every feature
+and command-line flag of
+.BR bup (1).
+Each test executes in an isolated temporary directory that is
+automatically cleaned up on exit.
+.PP
+Tests that require optional tools
+.RB ( gpg ", " bzip2 ", " xz ", " zstd )
+are automatically skipped when the tool is not installed.
+.SH OPTIONS
+.TP
+.BI \-t " PATTERN" "\fR,\fP \-\-test " PATTERN
+Run only tests whose name contains
+.IR PATTERN .
+The match is case-insensitive and uses substring matching.
+Can be specified multiple times; a test runs if it matches
+.B any
+pattern.
+.TP
+.BR \-l ", " \-\-list
+List all available test names and exit.
+Useful for discovering test names to pass to
+.BR \-t .
+.TP
+.BR \-v ", " \-\-verbose
+Show stdout/stderr from each
+.B bup
+invocation, even for passing tests.
+Failing tests always show their output regardless of this flag.
+.TP
+.BR \-x ", " \-\-fail\-fast
+Stop on the first test failure instead of continuing to run remaining
+tests.
+.TP
+.BR \-h ", " \-\-help
+Show built-in help and exit.
+.SH TEST GROUPS
+Tests are organized into the following sections:
+.TP
+.B BASIC
+Core single-directory backup, help flags, and error handling for
+missing arguments.
+.TP
+.B OUTPUT_DIR
+The
+.B \-o
+flag for specifying an alternate output directory.
+.TP
+.B VERBOSE
+The
+.B \-v
+/
+.B \-\-verbose
+flag.
+.TP
+.B EXCLUDE
+The
+.BR \-x ", " \-\-exclude\-vcs ", " \-\-exclude\-artifacts ", "
+.BR \-\-exclude\-secrets ", " \-\-exclude\-dev ", and " \-\-show\-excludes
+flags.
+.TP
+.B DRY_RUN
+The
+.B \-n
+/
+.B \-\-dry\-run
+flag and its interaction with other features.
+.TP
+.B MULTI_DIR
+Backing up multiple directories in a single invocation.
+.TP
+.B COMBINED
+The
+.B \-\-combined
+flag for bundling directories into a single tarball.
+.TP
+.B COMPRESSION
+The
+.B \-z
+/
+.B \-\-compress
+flag with gzip, bzip2, xz, and zstd.
+.TP
+.B ENCRYPTION
+The
+.B \-e
+/
+.B \-\-encrypt
+and
+.B \-\-recipient
+flags (requires gpg).
+.TP
+.B RETENTION
+The
+.B \-\-keep
+and
+.B \-\-prune
+flags for backup retention management.
+.TP
+.B LIST
+The
+.B \-\-list
+and
+.B \-L
+/
+.B \-\-list\-verbose
+flags.
+.TP
+.B SAVE_SCRIPT
+The
+.BR \-s ", " \-S ", and " \-d
+flags for generating re-runnable backup scripts.
+.TP
+.B PRE_POST
+Automatic execution of
+.B .bup\-pre.sh
+and
+.B .bup\-post.sh
+scripts.
+.TP
+.B NAMING
+Automatic conflict-free naming with numeric suffixes, and self-exclusion
+when the tarball is created inside the target directory.
+.TP
+.B ATOMIC
+Atomic write behavior (temporary file + mv).
+Verifies no temp files remain after a successful backup.
+.TP
+.B SIZE_REPORT
+Verification that backup size is reported after creation.
+.TP
+.B COLOR
+Color output support, including
+.B NO_COLOR
+environment variable and pipe detection.
+.TP
+.B BACKWARD_COMPAT
+Backward compatibility with the original invocation style.
+.TP
+.B ERROR
+Error handling for invalid inputs (unknown options, missing arguments).
+.SH TEST ASSETS
+.B test\-bup
+uses static fixture directories in the
+.B test\-assets/
+directory alongside the script:
+.TP
+.B project\-simple
+A minimal project with source files and documentation.
+.TP
+.B project\-artifacts
+A project containing common build artifacts (node_modules, target,
+\&.cache), secrets (.env, appsettings.json), and VCS files (.git).
+.TP
+.B project\-scripts
+A project with working .bup\-pre.sh and .bup\-post.sh scripts.
+.TP
+.B project\-fail\-pre
+A project whose .bup\-pre.sh always exits with failure.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+Disable colored test output.
+Also set implicitly for each
+.B bup
+invocation during testing to ensure deterministic output matching.
+.TP
+.B BUP_PATH
+Override the path to the
+.B bup
+binary under test.
+Defaults to
+.B ./bup
+relative to the test\-bup script.
+.SH EXIT STATUS
+.TP
+.B 0
+All tests passed or were skipped.
+.TP
+.B 1
+One or more tests failed.
+.SH EXAMPLES
+.nf
+test\-bup                          # run all tests
+test\-bup \-t compress              # run only compression tests
+test\-bup \-t exclude \-t retain     # run exclude and retention tests
+test\-bup \-l                       # list all test names
+test\-bup \-v                       # show output from all tests
+test\-bup \-v \-x                    # verbose, stop on first failure
+test\-bup \-t basic \-v              # run basic tests with verbose output
+.fi
+.SH SEE ALSO
+.BR bup (1)
+.SH AUTHORS
+Written with assistance from Claude.

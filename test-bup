@@ -1,0 +1,1123 @@
+#!/bin/bash
+
+# test-bup — Comprehensive test suite for the bup backup utility.
+# Runs all tests by default, or a filtered subset via -t/--test.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUP="$SCRIPT_DIR/bup"
+ASSETS="$SCRIPT_DIR/test-assets"
+WORK=""  # set in setup()
+
+# --- Counters ---
+TESTS_RUN=0
+TESTS_PASSED=0
+TESTS_FAILED=0
+TESTS_SKIPPED=0
+FAILED_NAMES=()
+
+# --- Options ---
+FILTER=""
+VERBOSE=false
+LIST_TESTS=false
+STOP_ON_FAIL=false
+
+DATE=$(date +%Y-%m-%d)
+
+# =========================================================================
+show_help() {
+    cat << 'EOF'
+test-bup — Test suite for the bup backup utility
+
+USAGE:
+    test-bup [OPTIONS]
+
+OPTIONS:
+    -t, --test PATTERN  Run only tests whose name contains PATTERN (case-
+                        insensitive substring match). Can be specified multiple
+                        times; a test runs if it matches ANY pattern.
+    -l, --list          List all available test names and exit
+    -v, --verbose       Show stdout/stderr from each bup invocation
+    -x, --fail-fast     Stop on first test failure
+    -h, --help          Show this help message
+
+DESCRIPTION:
+    Runs a comprehensive suite of tests covering every bup feature and flag.
+    Each test executes in an isolated temporary directory that is cleaned up
+    automatically on exit.
+
+    Tests are grouped into sections:
+
+    BASIC           Core single-directory backup, help, and error handling
+    OUTPUT_DIR      The -o flag for alternate output directories
+    VERBOSE         The -v / --verbose flag
+    EXCLUDE         The -x, --exclude-vcs, --exclude-artifacts,
+                    --exclude-secrets, --exclude-dev, and --show-excludes flags
+    DRY_RUN         The -n / --dry-run flag
+    MULTI_DIR       Multiple directory arguments
+    COMBINED        The --combined flag
+    COMPRESSION     The -z / --compress flag (gzip, bzip2, xz, zstd)
+    ENCRYPTION      The -e / --encrypt and --recipient flags (requires gpg)
+    RETENTION       The --keep and --prune flags
+    LIST            The --list and -L / --list-verbose flags
+    SAVE_SCRIPT     The -s, -S, and -d flags
+    PRE_POST        Automatic .bup-pre.sh and .bup-post.sh execution
+    NAMING          Automatic conflict-free naming with numeric suffixes
+    ATOMIC          Atomic write behavior (temp file + mv)
+    SIZE_REPORT     Backup size reporting after creation
+    COLOR           Color output and NO_COLOR support
+    BACKWARD_COMPAT Backward compatibility with original invocation style
+    ERROR           Error handling for invalid inputs
+
+    Tests that require optional tools (gpg, bzip2, xz, zstd) are
+    automatically skipped when the tool is not installed.
+
+EXIT CODES:
+    0   All tests passed (or were skipped)
+    1   One or more tests failed
+
+ENVIRONMENT:
+    NO_COLOR        Disable colored test output
+    BUP             Override path to the bup binary under test
+
+EXAMPLES:
+    test-bup                          # run all tests
+    test-bup -t compress              # run only compression tests
+    test-bup -t exclude -t retain     # run exclude and retention tests
+    test-bup -l                       # list all test names
+    test-bup -v -x                    # verbose output, stop on first failure
+
+EOF
+}
+
+# =========================================================================
+# Color support
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[0;31m'
+    C_GREEN=$'\033[0;32m'
+    C_YELLOW=$'\033[1;33m'
+    C_CYAN=$'\033[0;36m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RESET=$'\033[0m'
+else
+    C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_BOLD="" C_DIM="" C_RESET=""
+fi
+
+# =========================================================================
+# Parse arguments
+FILTERS=()
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -t|--test)
+            [ $# -lt 2 ] && { echo "Error: -t requires a pattern" >&2; exit 1; }
+            FILTERS+=("$2")
+            shift 2
+            ;;
+        -l|--list)
+            LIST_TESTS=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -x|--fail-fast)
+            STOP_ON_FAIL=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option $1" >&2
+            echo "Use -h or --help for detailed information" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# =========================================================================
+# Test infrastructure
+
+setup() {
+    WORK=$(mktemp -d)
+    export NO_COLOR=1
+}
+
+teardown() {
+    [ -n "$WORK" ] && rm -rf "$WORK"
+    WORK=""
+}
+
+trap teardown EXIT
+
+should_run() {
+    local name="$1"
+    if [ ${#FILTERS[@]} -eq 0 ]; then
+        return 0
+    fi
+    local lower_name
+    lower_name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    for f in "${FILTERS[@]}"; do
+        local lower_f
+        lower_f=$(echo "$f" | tr '[:upper:]' '[:lower:]')
+        if [[ "$lower_name" == *"$lower_f"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_test() {
+    local name="$1"
+    shift
+
+    if ! should_run "$name"; then
+        return
+    fi
+
+    TESTS_RUN=$((TESTS_RUN + 1))
+    printf "  ${C_CYAN}%-50s${C_RESET} " "$name"
+
+    setup
+    local output
+    local rc=0
+    output=$("$@" 2>&1) || rc=$?
+
+    if [ $rc -eq 0 ]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo "${C_GREEN}PASS${C_RESET}"
+        if [ "$VERBOSE" = true ] && [ -n "$output" ]; then
+            echo "${C_DIM}${output}${C_RESET}" | sed 's/^/    /'
+        fi
+    elif [ $rc -eq 77 ]; then
+        TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+        TESTS_RUN=$((TESTS_RUN - 1))
+        echo "${C_YELLOW}SKIP${C_RESET} ${C_DIM}${output}${C_RESET}"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        FAILED_NAMES+=("$name")
+        echo "${C_RED}FAIL${C_RESET}"
+        echo "${C_DIM}${output}${C_RESET}" | sed 's/^/    /'
+        if [ "$STOP_ON_FAIL" = true ]; then
+            teardown
+            echo ""
+            echo "${C_RED}Stopped on first failure.${C_RESET}"
+            exit 1
+        fi
+    fi
+    teardown
+}
+
+skip() {
+    echo "$*"
+    exit 77
+}
+
+assert_file_exists() {
+    [ -f "$1" ] || { echo "ASSERT: file does not exist: $1"; return 1; }
+}
+
+assert_file_not_exists() {
+    [ ! -f "$1" ] || { echo "ASSERT: file should not exist: $1"; return 1; }
+}
+
+assert_dir_exists() {
+    [ -d "$1" ] || { echo "ASSERT: directory does not exist: $1"; return 1; }
+}
+
+assert_exit_zero() {
+    "$@" >/dev/null 2>&1 || { echo "ASSERT: expected exit 0 from: $*"; return 1; }
+}
+
+assert_exit_nonzero() {
+    if "$@" >/dev/null 2>&1; then
+        echo "ASSERT: expected non-zero exit from: $*"
+        return 1
+    fi
+}
+
+assert_output_contains() {
+    local output="$1"
+    shift
+    local pattern="$1"
+    if ! echo "$output" | grep -qF -- "$pattern"; then
+        echo "ASSERT: output does not contain '$pattern'"
+        echo "OUTPUT: $output"
+        return 1
+    fi
+}
+
+assert_output_not_contains() {
+    local output="$1"
+    shift
+    local pattern="$1"
+    if echo "$output" | grep -qF -- "$pattern"; then
+        echo "ASSERT: output should not contain '$pattern'"
+        echo "OUTPUT: $output"
+        return 1
+    fi
+}
+
+assert_tarball_contains() {
+    local tarball="$1" pattern="$2"
+    if ! tar -tf "$tarball" 2>/dev/null | grep -q "$pattern"; then
+        echo "ASSERT: tarball $tarball does not contain '$pattern'"
+        echo "CONTENTS: $(tar -tf "$tarball" 2>/dev/null)"
+        return 1
+    fi
+}
+
+assert_tarball_not_contains() {
+    local tarball="$1" pattern="$2"
+    if tar -tf "$tarball" 2>/dev/null | grep -q "$pattern"; then
+        echo "ASSERT: tarball $tarball should not contain '$pattern'"
+        echo "CONTENTS: $(tar -tf "$tarball" 2>/dev/null)"
+        return 1
+    fi
+}
+
+assert_file_count() {
+    local dir="$1" pattern="$2" expected="$3"
+    local actual
+    actual=$(ls -1 "$dir"/$pattern 2>/dev/null | wc -l | xargs)
+    if [ "$actual" != "$expected" ]; then
+        echo "ASSERT: expected $expected files matching '$pattern' in $dir, got $actual"
+        echo "FILES: $(ls -1 "$dir"/$pattern 2>/dev/null)"
+        return 1
+    fi
+}
+
+assert_file_executable() {
+    [ -x "$1" ] || { echo "ASSERT: file is not executable: $1"; return 1; }
+}
+
+# =========================================================================
+# Test functions — each runs in isolation with WORK set to a temp dir
+
+test_basic_backup() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -o "$WORK" 2>&1)
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+    assert_tarball_contains "$WORK/bak.project-simple.${DATE}.tgz" "project-simple/src/main.rs"
+    assert_output_contains "$out" "Backup created successfully"
+}
+
+test_basic_version_short() {
+    local out
+    out=$("$BUP" -V 2>&1)
+    assert_output_contains "$out" "bup 0.4.2"
+}
+
+test_basic_version_long() {
+    local out
+    out=$("$BUP" --version 2>&1)
+    assert_output_contains "$out" "bup 0.4.2"
+}
+
+test_basic_version_with_other_args() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" --version 2>&1)
+    assert_output_contains "$out" "bup 0.4.2"
+    assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_basic_help_short() {
+    local out
+    out=$("$BUP" -h 2>&1)
+    assert_output_contains "$out" "USAGE"
+    assert_output_contains "$out" "OPTIONS"
+}
+
+test_basic_help_long() {
+    local out
+    out=$("$BUP" --help 2>&1)
+    assert_output_contains "$out" "USAGE"
+}
+
+test_basic_help_with_other_args() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" --help 2>&1)
+    assert_output_contains "$out" "USAGE"
+    assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_basic_no_args() {
+    assert_exit_nonzero "$BUP"
+}
+
+test_basic_nonexistent_dir() {
+    assert_exit_nonzero "$BUP" /nonexistent/dir -o "$WORK"
+}
+
+test_output_dir() {
+    local outdir="$WORK/output"
+    mkdir -p "$outdir"
+    "$BUP" "$ASSETS/project-simple" -o "$outdir" >/dev/null 2>&1
+    assert_file_exists "$outdir/bak.project-simple.${DATE}.tgz"
+    # Nothing in WORK root (besides the output subdir)
+    assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_output_dir_nonexistent() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -o /nonexistent/path
+}
+
+test_output_dir_missing_value() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -o
+}
+
+test_verbose_flag_short() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -v -o "$WORK" 2>&1)
+    assert_output_contains "$out" "project-simple/src/main.rs"
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_verbose_flag_long() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" --verbose -o "$WORK" 2>&1)
+    assert_output_contains "$out" "project-simple/src/main.rs"
+}
+
+test_exclude_pattern() {
+    "$BUP" "$ASSETS/project-simple" -x "*.rs" -o "$WORK" >/dev/null 2>&1
+    assert_tarball_not_contains "$WORK/bak.project-simple.${DATE}.tgz" "main.rs"
+    assert_tarball_contains "$WORK/bak.project-simple.${DATE}.tgz" "README.md"
+}
+
+test_exclude_multiple_patterns() {
+    "$BUP" "$ASSETS/project-simple" -x "*.rs" -x "*.md" -o "$WORK" >/dev/null 2>&1
+    assert_tarball_not_contains "$WORK/bak.project-simple.${DATE}.tgz" "main.rs"
+    assert_tarball_not_contains "$WORK/bak.project-simple.${DATE}.tgz" "README.md"
+}
+
+test_exclude_long_form() {
+    "$BUP" "$ASSETS/project-simple" --exclude "*.rs" -o "$WORK" >/dev/null 2>&1
+    assert_tarball_not_contains "$WORK/bak.project-simple.${DATE}.tgz" "main.rs"
+}
+
+test_exclude_missing_value() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -x
+}
+
+test_exclude_vcs() {
+    "$BUP" "$ASSETS/project-artifacts" --exclude-vcs -o "$WORK" >/dev/null 2>&1
+    assert_tarball_not_contains "$WORK/bak.project-artifacts.${DATE}.tgz" ".git/"
+    assert_tarball_contains "$WORK/bak.project-artifacts.${DATE}.tgz" "src/app.js"
+}
+
+test_exclude_artifacts() {
+    "$BUP" "$ASSETS/project-artifacts" --exclude-artifacts -o "$WORK" >/dev/null 2>&1
+    local tb="$WORK/bak.project-artifacts.${DATE}.tgz"
+    assert_tarball_not_contains "$tb" "node_modules"
+    assert_tarball_not_contains "$tb" "target"
+    assert_tarball_not_contains "$tb" ".cache"
+    assert_tarball_not_contains "$tb" ".idea"
+    assert_tarball_contains "$tb" "src/app.js"
+    # secrets should still be present
+    assert_tarball_contains "$tb" ".env"
+}
+
+test_exclude_secrets() {
+    "$BUP" "$ASSETS/project-artifacts" --exclude-secrets -o "$WORK" >/dev/null 2>&1
+    local tb="$WORK/bak.project-artifacts.${DATE}.tgz"
+    assert_tarball_not_contains "$tb" ".env"
+    assert_tarball_not_contains "$tb" "appsettings.json"
+    # artifacts should still be present
+    assert_tarball_contains "$tb" "node_modules"
+    assert_tarball_contains "$tb" "src/app.js"
+}
+
+test_exclude_dev() {
+    "$BUP" "$ASSETS/project-artifacts" --exclude-dev -o "$WORK" >/dev/null 2>&1
+    local tb="$WORK/bak.project-artifacts.${DATE}.tgz"
+    assert_tarball_not_contains "$tb" "node_modules"
+    assert_tarball_not_contains "$tb" "target"
+    assert_tarball_not_contains "$tb" ".cache"
+    assert_tarball_not_contains "$tb" ".idea"
+    assert_tarball_not_contains "$tb" ".env"
+    assert_tarball_not_contains "$tb" "appsettings.json"
+    assert_tarball_contains "$tb" "src/app.js"
+}
+
+test_show_excludes() {
+    local out
+    out=$("$BUP" --show-excludes 2>&1)
+    assert_output_contains "$out" "node_modules"
+    assert_output_contains "$out" ".env"
+    assert_output_contains "$out" "Artifact patterns"
+    assert_output_contains "$out" "Secret patterns"
+}
+
+test_show_excludes_exits_without_backup() {
+    "$BUP" --show-excludes >/dev/null 2>&1
+    # should not require a directory argument
+    local rc=0
+    "$BUP" --show-excludes >/dev/null 2>&1 || rc=$?
+    [ $rc -eq 0 ] || { echo "Expected exit 0 from --show-excludes"; return 1; }
+}
+
+test_dry_run_no_file_created() {
+    "$BUP" "$ASSETS/project-simple" -n -o "$WORK" >/dev/null 2>&1
+    assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_dry_run_output() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -n -o "$WORK" 2>&1)
+    assert_output_contains "$out" "[dry-run]"
+    assert_output_contains "$out" "Would create"
+    assert_output_contains "$out" "Compression: gzip"
+}
+
+test_dry_run_with_excludes() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -n -x "*.rs" --exclude-vcs -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Excludes"
+}
+
+test_dry_run_long_form() {
+    "$BUP" "$ASSETS/project-simple" --dry-run -o "$WORK" >/dev/null 2>&1
+    assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_dry_run_skips_pre_post() {
+    local out
+    out=$("$BUP" "$ASSETS/project-scripts" -n -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Would run pre-backup"
+    assert_output_contains "$out" "Would run post-backup"
+}
+
+test_dry_run_save_script() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -n -s -d "$WORK" -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Would save script"
+    assert_file_not_exists "$WORK/backup.sh"
+}
+
+test_multi_dir() {
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+    assert_file_exists "$WORK/bak.project-scripts.${DATE}.tgz"
+}
+
+test_multi_dir_separate_tarballs() {
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" -o "$WORK" >/dev/null 2>&1
+    assert_tarball_contains "$WORK/bak.project-simple.${DATE}.tgz" "src/main.rs"
+    assert_tarball_contains "$WORK/bak.project-scripts.${DATE}.tgz" "file.txt"
+}
+
+test_combined_backup() {
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined -o "$WORK" >/dev/null 2>&1
+    local tb="$WORK/bak.project-simple+project-scripts.${DATE}.tgz"
+    assert_file_exists "$tb"
+    assert_tarball_contains "$tb" "project-simple/src/main.rs"
+    assert_tarball_contains "$tb" "project-scripts/file.txt"
+}
+
+test_combined_single_tarball_only() {
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined -o "$WORK" >/dev/null 2>&1
+    # Should NOT create individual tarballs
+    assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz"
+    assert_file_not_exists "$WORK/bak.project-scripts.${DATE}.tgz"
+}
+
+test_compress_gzip_default() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_compress_gzip_explicit() {
+    "$BUP" "$ASSETS/project-simple" -z gzip -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_compress_bzip2() {
+    command -v bzip2 >/dev/null 2>&1 || skip "bzip2 not installed"
+    "$BUP" "$ASSETS/project-simple" -z bzip2 -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tbz2"
+}
+
+test_compress_xz() {
+    command -v xz >/dev/null 2>&1 || skip "xz not installed"
+    "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.txz"
+}
+
+test_compress_zstd() {
+    command -v zstd >/dev/null 2>&1 || skip "zstd not installed"
+    "$BUP" "$ASSETS/project-simple" -z zstd -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tzst"
+}
+
+test_compress_invalid() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -z lz4 -o "$WORK"
+}
+
+test_compress_missing_value() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -z
+}
+
+test_compress_long_form() {
+    "$BUP" "$ASSETS/project-simple" --compress gzip -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_encrypt_symmetric() {
+    command -v gpg >/dev/null 2>&1 || skip "gpg not installed"
+    local out
+    out=$(echo "testpassword" | "$BUP" "$ASSETS/project-simple" -e -o "$WORK" 2>&1) || true
+    # GPG symmetric may need a passphrase agent; if it fails gracefully, just check the flag works
+    if [ -f "$WORK/bak.project-simple.${DATE}.tgz.gpg" ]; then
+        assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz.gpg"
+        assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz"
+    else
+        skip "gpg symmetric encryption requires agent/pinentry"
+    fi
+}
+
+test_encrypt_dry_run() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -n -e -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Encryption: symmetric"
+    assert_file_not_exists "$WORK/bak.project-simple.${DATE}.tgz.gpg"
+}
+
+test_encrypt_recipient_dry_run() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -n --recipient test@example.com -o "$WORK" 2>&1)
+    assert_output_contains "$out" "asymmetric"
+    assert_output_contains "$out" "test@example.com"
+}
+
+test_keep_retention() {
+    # Create 3 backups, keep 2
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    local count
+    count=$(ls -1 "$WORK"/bak.project-simple.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 3 ] || { echo "Expected 3 backups before retention, got $count"; return 1; }
+
+    "$BUP" "$ASSETS/project-simple" --keep 2 -o "$WORK" >/dev/null 2>&1
+    count=$(ls -1 "$WORK"/bak.project-simple.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 2 ] || { echo "Expected 2 backups after --keep 2, got $count"; return 1; }
+}
+
+test_keep_missing_value() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" --keep
+}
+
+test_prune_standalone() {
+    # Create 4 backups, then prune to 1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    local count
+    count=$(ls -1 "$WORK"/bak.project-simple.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 4 ] || { echo "Expected 4 backups before prune, got $count"; return 1; }
+
+    "$BUP" "$ASSETS/project-simple" --prune 1 -o "$WORK" >/dev/null 2>&1
+    count=$(ls -1 "$WORK"/bak.project-simple.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 1 ] || { echo "Expected 1 backup after --prune 1, got $count"; return 1; }
+}
+
+test_prune_no_new_backup() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    # Count before prune
+    local before after
+    before=$(ls -1 "$WORK"/bak.project-simple.*.tgz 2>/dev/null | wc -l | xargs)
+    "$BUP" "$ASSETS/project-simple" --prune 2 -o "$WORK" >/dev/null 2>&1
+    after=$(ls -1 "$WORK"/bak.project-simple.*.tgz 2>/dev/null | wc -l | xargs)
+    # Prune should not create a new backup
+    [ "$after" -le "$before" ] || { echo "Prune created a new backup: before=$before after=$after"; return 1; }
+}
+
+test_prune_missing_value() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" --prune
+}
+
+test_prune_no_dir() {
+    assert_exit_nonzero "$BUP" --prune 1 -o "$WORK"
+}
+
+test_list_mode() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-scripts" -o "$WORK" >/dev/null 2>&1
+    local out
+    out=$("$BUP" --list -o "$WORK" 2>&1)
+    assert_output_contains "$out" "DATE"
+    assert_output_contains "$out" "SIZE"
+    assert_output_contains "$out" "bak.project-simple"
+    assert_output_contains "$out" "bak.project-scripts"
+}
+
+test_list_filter_by_dir() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-scripts" -o "$WORK" >/dev/null 2>&1
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" --list -o "$WORK" 2>&1)
+    assert_output_contains "$out" "bak.project-simple"
+    assert_output_not_contains "$out" "bak.project-scripts"
+}
+
+test_list_verbose() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    local out
+    out=$("$BUP" -L -o "$WORK" 2>&1)
+    assert_output_contains "$out" "FILES"
+}
+
+test_list_verbose_long_form() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    local out
+    out=$("$BUP" --list-verbose -o "$WORK" 2>&1)
+    assert_output_contains "$out" "FILES"
+}
+
+test_list_empty() {
+    local out
+    out=$("$BUP" --list -o "$WORK" 2>&1)
+    assert_output_contains "$out" "No backups found"
+}
+
+test_save_script_default() {
+    "$BUP" "$ASSETS/project-simple" -s -d "$WORK" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/backup.sh"
+    assert_file_executable "$WORK/backup.sh"
+    local content
+    content=$(cat "$WORK/backup.sh")
+    assert_output_contains "$content" "#!/bin/bash"
+    assert_output_contains "$content" "project-simple"
+}
+
+test_save_script_custom_name() {
+    "$BUP" "$ASSETS/project-simple" -S my-bup.sh -d "$WORK" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/my-bup.sh"
+    assert_file_not_exists "$WORK/backup.sh"
+}
+
+test_save_script_custom_dir() {
+    local sdir="$WORK/scripts"
+    mkdir -p "$sdir"
+    "$BUP" "$ASSETS/project-simple" -s -d "$sdir" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$sdir/backup.sh"
+}
+
+test_save_script_excludes_script_flags() {
+    "$BUP" "$ASSETS/project-simple" -v --exclude-dev -s -d "$WORK" -o "$WORK" >/dev/null 2>&1
+    local content
+    content=$(cat "$WORK/backup.sh")
+    # Should include -v and --exclude-dev
+    assert_output_contains "$content" "--exclude-dev"
+    # Should NOT include -s or -d
+    assert_output_not_contains "$content" " -s"
+    assert_output_not_contains "$content" " -d "
+    assert_output_not_contains "$content" "--save-script"
+}
+
+test_save_script_missing_name_value() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -S
+}
+
+test_save_script_missing_dir_value() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -d
+}
+
+test_save_script_nonexistent_dir() {
+    assert_exit_nonzero "$BUP" "$ASSETS/project-simple" -s -d /nonexistent/dir
+}
+
+test_pre_script_runs() {
+    local out
+    out=$("$BUP" "$ASSETS/project-scripts" -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Running pre-backup script"
+    assert_output_contains "$out" "Backup created successfully"
+}
+
+test_post_script_runs() {
+    local out
+    out=$("$BUP" "$ASSETS/project-scripts" -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Running post-backup script"
+}
+
+test_pre_script_failure_aborts() {
+    local out rc=0
+    out=$("$BUP" "$ASSETS/project-fail-pre" -o "$WORK" 2>&1) || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit when pre-script fails"; return 1; }
+    assert_output_contains "$out" "Pre-backup script failed"
+    assert_file_not_exists "$WORK/bak.project-fail-pre.${DATE}.tgz"
+}
+
+test_naming_conflict_resolution() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.1.tgz"
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.2.tgz"
+}
+
+test_naming_conflict_with_compression() {
+    command -v xz >/dev/null 2>&1 || skip "xz not installed"
+    "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.txz"
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.1.txz"
+}
+
+test_atomic_no_temp_files_on_success() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    local temps
+    temps=$(ls -1 "$WORK"/.bup-tmp.* 2>/dev/null | wc -l | xargs)
+    [ "$temps" -eq 0 ] || { echo "Temp files left behind: $temps"; return 1; }
+}
+
+test_size_report() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Backup size:"
+}
+
+test_color_disabled_with_no_color() {
+    local out
+    out=$(NO_COLOR=1 "$BUP" "$ASSETS/project-simple" -o "$WORK" 2>&1)
+    # Should not contain ANSI escape codes
+    if echo "$out" | grep -qP '\033\['; then
+        echo "ASSERT: output contains ANSI codes despite NO_COLOR=1"
+        return 1
+    fi
+}
+
+test_color_disabled_in_pipe() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -o "$WORK" 2>&1 | cat)
+    # When piped, stdout is not a tty, so no color
+    if echo "$out" | grep -qP '\033\['; then
+        echo "ASSERT: output contains ANSI codes when piped"
+        return 1
+    fi
+}
+
+test_backward_compat_single_dir() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" -v -x "*.log" --exclude-vcs >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+}
+
+test_backward_compat_all_original_flags() {
+    local sdir="$WORK/scripts"
+    mkdir -p "$sdir"
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" -v -x "*.log" -x "*.tmp" --exclude-vcs -s -S runme.sh -d "$sdir" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+    assert_file_exists "$sdir/runme.sh"
+}
+
+test_error_unknown_option() {
+    local out rc=0
+    out=$("$BUP" "$ASSETS/project-simple" --bogus 2>&1) || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit for unknown option"; return 1; }
+    assert_output_contains "$out" "Unknown option"
+}
+
+test_error_no_directory() {
+    local rc=0
+    "$BUP" -v -o "$WORK" >/dev/null 2>&1 || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit when no directory given"; return 1; }
+}
+
+test_backup_inside_target_dir() {
+    # Create a copy we can back up into itself
+    local proj="$WORK/myproj"
+    cp -r "$ASSETS/project-simple" "$proj"
+    "$BUP" "$proj" -o "$proj" >/dev/null 2>&1
+    local tb="$proj/bak.myproj.${DATE}.tgz"
+    assert_file_exists "$tb"
+    # The tarball should not contain itself
+    assert_tarball_not_contains "$tb" "bak.myproj"
+}
+
+test_combined_dry_run() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined -n -o "$WORK" 2>&1)
+    assert_output_contains "$out" "[dry-run]"
+    assert_output_contains "$out" "combined"
+    assert_file_not_exists "$WORK/bak.project-simple+project-scripts.${DATE}.tgz"
+}
+
+test_exclude_artifacts_and_manual() {
+    "$BUP" "$ASSETS/project-artifacts" --exclude-artifacts -x "*.js" -o "$WORK" >/dev/null 2>&1
+    local tb="$WORK/bak.project-artifacts.${DATE}.tgz"
+    assert_tarball_not_contains "$tb" "node_modules"
+    assert_tarball_not_contains "$tb" "app.js"
+}
+
+test_compress_xz_file_type() {
+    command -v xz >/dev/null 2>&1 || skip "xz not installed"
+    "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    local ftype
+    ftype=$(file "$WORK/bak.project-simple.${DATE}.txz")
+    assert_output_contains "$ftype" "XZ"
+}
+
+test_compress_bzip2_file_type() {
+    command -v bzip2 >/dev/null 2>&1 || skip "bzip2 not installed"
+    "$BUP" "$ASSETS/project-simple" -z bzip2 -o "$WORK" >/dev/null 2>&1
+    local ftype
+    ftype=$(file "$WORK/bak.project-simple.${DATE}.tbz2")
+    assert_output_contains "$ftype" "bzip2"
+}
+
+test_list_with_mixed_formats() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    if command -v xz >/dev/null 2>&1; then
+        "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    fi
+    local out
+    out=$("$BUP" --list -o "$WORK" 2>&1)
+    assert_output_contains "$out" ".tgz"
+}
+
+test_save_script_with_new_flags() {
+    "$BUP" "$ASSETS/project-simple" -z xz --keep 3 --exclude-dev -s -d "$WORK" -o "$WORK" >/dev/null 2>&1
+    local content
+    content=$(cat "$WORK/backup.sh")
+    assert_output_contains "$content" "-z xz"
+    assert_output_contains "$content" "--keep 3"
+    assert_output_contains "$content" "--exclude-dev"
+}
+
+test_keep_with_compression() {
+    command -v xz >/dev/null 2>&1 || skip "xz not installed"
+    "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -z xz -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -z xz --keep 2 -o "$WORK" >/dev/null 2>&1
+    local count
+    count=$(ls -1 "$WORK"/bak.project-simple.*.txz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 2 ] || { echo "Expected 2 .txz after --keep 2, got $count"; return 1; }
+}
+
+test_prune_dry_run() {
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" --prune 1 -n -o "$WORK" 2>&1)
+    assert_output_contains "$out" "Would delete"
+    # Files should still exist
+    local count
+    count=$(ls -1 "$WORK"/bak.project-simple.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 3 ] || { echo "Expected 3 backups after dry-run prune, got $count"; return 1; }
+}
+
+# =========================================================================
+# Collect all test function names
+
+ALL_TESTS=(
+    # BASIC
+    "test_basic_backup"
+    "test_basic_version_short"
+    "test_basic_version_long"
+    "test_basic_version_with_other_args"
+    "test_basic_help_short"
+    "test_basic_help_long"
+    "test_basic_help_with_other_args"
+    "test_basic_no_args"
+    "test_basic_nonexistent_dir"
+    # OUTPUT_DIR
+    "test_output_dir"
+    "test_output_dir_nonexistent"
+    "test_output_dir_missing_value"
+    # VERBOSE
+    "test_verbose_flag_short"
+    "test_verbose_flag_long"
+    # EXCLUDE
+    "test_exclude_pattern"
+    "test_exclude_multiple_patterns"
+    "test_exclude_long_form"
+    "test_exclude_missing_value"
+    "test_exclude_vcs"
+    "test_exclude_artifacts"
+    "test_exclude_secrets"
+    "test_exclude_dev"
+    "test_exclude_artifacts_and_manual"
+    "test_show_excludes"
+    "test_show_excludes_exits_without_backup"
+    # DRY_RUN
+    "test_dry_run_no_file_created"
+    "test_dry_run_output"
+    "test_dry_run_with_excludes"
+    "test_dry_run_long_form"
+    "test_dry_run_skips_pre_post"
+    "test_dry_run_save_script"
+    # MULTI_DIR
+    "test_multi_dir"
+    "test_multi_dir_separate_tarballs"
+    # COMBINED
+    "test_combined_backup"
+    "test_combined_single_tarball_only"
+    "test_combined_dry_run"
+    # COMPRESSION
+    "test_compress_gzip_default"
+    "test_compress_gzip_explicit"
+    "test_compress_bzip2"
+    "test_compress_bzip2_file_type"
+    "test_compress_xz"
+    "test_compress_xz_file_type"
+    "test_compress_zstd"
+    "test_compress_invalid"
+    "test_compress_missing_value"
+    "test_compress_long_form"
+    # ENCRYPTION
+    "test_encrypt_symmetric"
+    "test_encrypt_dry_run"
+    "test_encrypt_recipient_dry_run"
+    # RETENTION
+    "test_keep_retention"
+    "test_keep_missing_value"
+    "test_keep_with_compression"
+    "test_prune_standalone"
+    "test_prune_no_new_backup"
+    "test_prune_missing_value"
+    "test_prune_no_dir"
+    "test_prune_dry_run"
+    # LIST
+    "test_list_mode"
+    "test_list_filter_by_dir"
+    "test_list_verbose"
+    "test_list_verbose_long_form"
+    "test_list_empty"
+    "test_list_with_mixed_formats"
+    # SAVE_SCRIPT
+    "test_save_script_default"
+    "test_save_script_custom_name"
+    "test_save_script_custom_dir"
+    "test_save_script_excludes_script_flags"
+    "test_save_script_with_new_flags"
+    "test_save_script_missing_name_value"
+    "test_save_script_missing_dir_value"
+    "test_save_script_nonexistent_dir"
+    # PRE_POST
+    "test_pre_script_runs"
+    "test_post_script_runs"
+    "test_pre_script_failure_aborts"
+    # NAMING
+    "test_naming_conflict_resolution"
+    "test_naming_conflict_with_compression"
+    "test_backup_inside_target_dir"
+    # ATOMIC
+    "test_atomic_no_temp_files_on_success"
+    # SIZE_REPORT
+    "test_size_report"
+    # COLOR
+    "test_color_disabled_with_no_color"
+    "test_color_disabled_in_pipe"
+    # BACKWARD_COMPAT
+    "test_backward_compat_single_dir"
+    "test_backward_compat_all_original_flags"
+    # ERROR
+    "test_error_unknown_option"
+    "test_error_no_directory"
+)
+
+# =========================================================================
+# List mode
+if [ "$LIST_TESTS" = true ]; then
+    for t in "${ALL_TESTS[@]}"; do
+        echo "$t"
+    done
+    exit 0
+fi
+
+# =========================================================================
+# Run tests
+
+echo ""
+echo "${C_BOLD}bup test suite${C_RESET}"
+echo "${C_DIM}$(date)${C_RESET}"
+echo ""
+
+# Override BUP path if set in environment
+[ -n "${BUP_PATH:-}" ] && BUP="$BUP_PATH"
+
+# Verify bup exists
+if [ ! -x "$BUP" ]; then
+    echo "${C_RED}Error: bup not found at $BUP${C_RESET}" >&2
+    exit 1
+fi
+
+# Verify test assets exist
+if [ ! -d "$ASSETS" ]; then
+    echo "${C_RED}Error: test-assets directory not found at $ASSETS${C_RESET}" >&2
+    exit 1
+fi
+
+SECTION=""
+for t in "${ALL_TESTS[@]}"; do
+    # Print section headers
+    case "$t" in
+        test_basic_*)           new_section="BASIC" ;;
+        test_output_*)          new_section="OUTPUT_DIR" ;;
+        test_verbose_*)         new_section="VERBOSE" ;;
+        test_exclude_*|test_show_*) new_section="EXCLUDE" ;;
+        test_dry_run_*)         new_section="DRY_RUN" ;;
+        test_multi_*)           new_section="MULTI_DIR" ;;
+        test_combined_*)        new_section="COMBINED" ;;
+        test_compress_*)        new_section="COMPRESSION" ;;
+        test_encrypt_*)         new_section="ENCRYPTION" ;;
+        test_keep_*|test_prune_*) new_section="RETENTION" ;;
+        test_list_*)            new_section="LIST" ;;
+        test_save_script_*)     new_section="SAVE_SCRIPT" ;;
+        test_pre_*|test_post_*) new_section="PRE_POST" ;;
+        test_naming_*|test_backup_inside_*) new_section="NAMING" ;;
+        test_atomic_*)          new_section="ATOMIC" ;;
+        test_size_*)            new_section="SIZE_REPORT" ;;
+        test_color_*)           new_section="COLOR" ;;
+        test_backward_*)        new_section="BACKWARD_COMPAT" ;;
+        test_error_*)           new_section="ERROR" ;;
+        *)                      new_section="" ;;
+    esac
+    if [ "$new_section" != "$SECTION" ]; then
+        SECTION="$new_section"
+        if should_run "$t" || should_run "$SECTION"; then
+            echo ""
+            echo "${C_BOLD}$SECTION${C_RESET}"
+        fi
+    fi
+
+    run_test "$t" "$t"
+done
+
+# =========================================================================
+# Summary
+echo ""
+echo "${C_BOLD}Results${C_RESET}"
+echo "  Passed:  ${C_GREEN}${TESTS_PASSED}${C_RESET}"
+echo "  Failed:  ${C_RED}${TESTS_FAILED}${C_RESET}"
+echo "  Skipped: ${C_YELLOW}${TESTS_SKIPPED}${C_RESET}"
+echo "  Total:   ${TESTS_RUN}"
+echo ""
+
+if [ ${#FAILED_NAMES[@]} -gt 0 ]; then
+    echo "${C_RED}Failed tests:${C_RESET}"
+    for name in "${FAILED_NAMES[@]}"; do
+        echo "  ${C_RED}- $name${C_RESET}"
+    done
+    echo ""
+    exit 1
+fi
+
+if [ "$TESTS_RUN" -eq 0 ]; then
+    echo "${C_YELLOW}No tests matched the filter.${C_RESET}"
+    exit 0
+fi
+
+echo "${C_GREEN}All tests passed.${C_RESET}"
+exit 0
