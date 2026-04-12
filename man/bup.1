@@ -59,6 +59,13 @@ Shorthand for
 .B \-\-show\-excludes
 Print the full list of artifact and secret exclusion patterns and exit.
 .TP
+.B \-\-show\-excluded
+Preview which files would be excluded from the backup without creating
+one.
+Requires at least one directory argument and respects all exclusion
+flags
+.RB ( \-x ", " \-\-exclude\-vcs ", " \-\-exclude\-artifacts ", etc.)."
+.TP
 .BR \-v ", " \-\-verbose
 Enable verbose output.
 Sets the
@@ -153,6 +160,22 @@ instead of the current directory.
 Implies
 .BR \-s .
 .TP
+.B \-\-no\-scripts
+Skip automatic execution of
+.B .bup\-pre.sh
+and
+.B .bup\-post.sh
+scripts.
+Useful when backing up untrusted directories.
+.TP
+.B \-\-include\-backups
+Include prior backup files when the output directory is inside the
+directory being backed up.
+By default, existing
+.B bak.*
+files are automatically excluded in this situation to prevent backups
+from snowballing in size.
+.TP
 .BR \-V ", " \-\-version
 Show version number and exit.
 .TP
@@ -160,24 +183,38 @@ Show version number and exit.
 Show built-in help and exit.
 .SH EXCLUSION PATTERNS
 .SS Artifact patterns (\-\-exclude\-artifacts)
+The following patterns match at any depth in the directory tree:
+.PP
 .B Dependency directories:
-node_modules, bower_components, vendor, .bundle, jspm_packages, packages
+node_modules, bower_components, .bundle, jspm_packages
 .PP
 .B Build outputs:
-target, build, dist, out, bin, obj, _build, cmake-build-*, *.egg-info,
-__pycache__, *.pyc
+cmake-build-*, *.egg-info, __pycache__, *.pyc
 .PP
 .B Caches:
 \&.cache, .parcel-cache, .next, .nuxt, .turbo, .angular, .svelte-kit,
 \&.gradle, .sass-cache, .pytest_cache, .mypy_cache, .ruff_cache, .tox,
-\&.nox, .venv, venv, .eggs, .hypothesis, .coverage, htmlcov,
+\&.nox, .venv, .eggs, .hypothesis, .coverage, htmlcov,
 \&.phpunit.cache, .jest-cache
 .PP
 .B IDE / editor:
 \&.idea, .vs, .vscode, *.swp, *.swo, *~, .DS_Store
 .PP
 .B Misc:
-artifacts, .terraform, .serverless, cdk.out, .aws-sam, .vagrant
+\&.terraform, .serverless, cdk.out, .aws-sam, .vagrant
+.PP
+The following patterns have generic names that could match legitimate
+project content, so they are anchored to the
+.B top level
+of the backed-up directory only (e.g., a top-level
+.B bin/
+is excluded but a nested
+.B src/bin/
+is preserved):
+.PP
+.B Top-level only:
+vendor, packages, target, build, dist, out, bin, obj, _build, venv,
+artifacts
 .SS Secret patterns (\-\-exclude\-secrets)
 .B Environment files:
 \&.env, .env.*, appsettings.json, appsettings.*.json, secrets.json,
@@ -208,6 +245,10 @@ Both scripts run with the target directory as the working directory and
 receive
 .B BUP_VERBOSE=1
 when verbose mode is enabled.
+.PP
+Use
+.B \-\-no\-scripts
+to disable automatic script execution entirely.
 .SH ENVIRONMENT
 .TP
 .B BUP_VERBOSE
@@ -246,6 +287,7 @@ bup \-\-list \-o /backup
 bup /home/user/project \-L \-o /backup
 bup /home/user/project \-s \-o /backup
 bup \-\-show\-excludes
+bup /home/user/project \-\-exclude\-dev \-\-show\-excluded
 .fi
 .SH SEE ALSO
 .BR tar (1),

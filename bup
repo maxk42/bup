@@ -6,7 +6,7 @@
 # for a project.  (For example you could run `cargo clean` before
 # backup and `cargo build` after.)
 
-BUP_VERSION="0.4.2"
+BUP_VERSION="0.4.5"
 
 show_help() {
     cat << EOF
@@ -33,6 +33,8 @@ OPTIONS:
     --exclude-dev      Exclude both artifacts and secrets (shorthand for
                        --exclude-artifacts --exclude-secrets)
     --show-excludes    Print all exclusion patterns and exit
+    --show-excluded    Preview which files would be excluded from the backup
+                       (no backup is created)
     -v, --verbose      Enable verbose output and set BUP_VERBOSE environment
                        variable for pre/post scripts
     -n, --dry-run      Show what would happen without creating a backup
@@ -56,6 +58,11 @@ OPTIONS:
     -d, --script-dir directory
                        Write the script to 'directory' instead of the current
                        directory (implies --save-script)
+    --no-scripts       Skip automatic execution of .bup-pre.sh and
+                       .bup-post.sh scripts
+    --include-backups  Include prior backup files when the output directory
+                       is inside the directory being backed up (by default
+                       they are excluded)
     -V, --version      Show version number and exit
     -h, --help         Show this help message
 
@@ -110,6 +117,7 @@ EXAMPLES:
     $0 /home/user/project --exclude-artifacts
     $0 /home/user/project --exclude-dev -o /backup
     $0 --show-excludes
+    $0 /home/user/project --exclude-dev --show-excluded
 
 EOF
 }
@@ -134,20 +142,29 @@ msg_info() { echo "${C_CYAN}$*${C_RESET}"; }
 # --- Exclusion pattern lists ---
 
 ARTIFACT_PATTERNS=(
-    # Dependency directories
-    "node_modules" "bower_components" "vendor" ".bundle" "jspm_packages" "packages"
-    # Build output directories
-    "target" "build" "dist" "out" "bin" "obj" "_build" "cmake-build-*"
-    "*.egg-info" "__pycache__" "*.pyc"
+    # Dependency directories (specific enough to match anywhere)
+    "node_modules" "bower_components" ".bundle" "jspm_packages"
+    # Build output directories (specific enough to match anywhere)
+    "cmake-build-*" "*.egg-info" "__pycache__" "*.pyc"
     # Cache / temp directories
     ".cache" ".parcel-cache" ".next" ".nuxt" ".turbo" ".angular" ".svelte-kit"
     ".gradle" ".sass-cache" ".pytest_cache" ".mypy_cache" ".ruff_cache"
-    ".tox" ".nox" ".venv" "venv" ".eggs" ".hypothesis"
+    ".tox" ".nox" ".venv" ".eggs" ".hypothesis"
     ".coverage" "htmlcov" ".phpunit.cache" ".jest-cache"
     # IDE / editor artifacts
     ".idea" ".vs" ".vscode" "*.swp" "*.swo" "*~" ".DS_Store"
-    # Misc artifacts
-    "artifacts" ".terraform" ".serverless" "cdk.out" ".aws-sam" ".vagrant"
+    # Misc artifacts (specific enough to match anywhere)
+    ".terraform" ".serverless" "cdk.out" ".aws-sam" ".vagrant"
+)
+
+# Artifact patterns with generic names that could match legitimate project
+# content at deeper levels.  These are anchored to the top level of the
+# backed-up directory (i.e. --exclude=dirname/pattern) so that a nested
+# src/bin/ or lib/packages/ is not accidentally excluded.
+ARTIFACT_PATTERNS_ANCHORED=(
+    "vendor" "packages"
+    "target" "build" "dist" "out" "bin" "obj" "_build"
+    "venv" "artifacts"
 )
 
 SECRET_PATTERNS=(
@@ -166,16 +183,90 @@ SECRET_PATTERNS=(
 
 # --- Utility functions ---
 
+# Build anchored exclude arguments for a given directory name.
+# Appends to the caller's TAR_EXCLUDE_ARGS array.
+build_anchored_excludes() {
+    local dir_name="$1"
+    local pattern
+    for pattern in "${ANCHORED_PATTERNS[@]}"; do
+        TAR_EXCLUDE_ARGS+=("--exclude=${dir_name}/${pattern}")
+    done
+}
+
+do_show_excluded() {
+    local dir="$1"
+    dir=$(realpath "$dir")
+    local dir_name
+    dir_name=$(basename "$dir")
+    local parent
+    parent=$(dirname "$dir")
+
+    # Build exclusion arguments
+    local -a TAR_EXCLUDE_ARGS=()
+    local pattern
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        TAR_EXCLUDE_ARGS+=("--exclude=$pattern")
+    done
+    if [ "$EXCLUDE_VCS" = true ]; then
+        TAR_EXCLUDE_ARGS+=("--exclude-vcs")
+    fi
+    build_anchored_excludes "$dir_name"
+
+    if [ ${#TAR_EXCLUDE_ARGS[@]} -eq 0 ]; then
+        msg_info "No exclusion patterns active for $dir_name."
+        return
+    fi
+
+    # Get full file listing (no excludes)
+    local full_list filtered_list
+    full_list=$(tar -cf - -C "$parent" "$dir_name" 2>/dev/null | tar -tf - 2>/dev/null | sort)
+    # Get filtered file listing (with excludes)
+    filtered_list=$(tar -cf - "${TAR_EXCLUDE_ARGS[@]}" -C "$parent" "$dir_name" 2>/dev/null | tar -tf - 2>/dev/null | sort)
+
+    # Compute excluded files
+    local excluded
+    excluded=$(comm -23 <(echo "$full_list") <(echo "$filtered_list"))
+
+    if [ -z "$excluded" ]; then
+        msg_info "No files would be excluded from $dir_name."
+    else
+        local count
+        count=$(echo "$excluded" | wc -l | xargs)
+        echo "${C_BOLD}Excluded files in ${dir_name} (${count}):${C_RESET}"
+        echo "$excluded" | sed "s/^/  ${C_YELLOW}/;s/$/${C_RESET}/"
+    fi
+}
+
+# List backup files for a given directory name, sorted by modification
+# time.  Uses a broad glob then filters with string comparison so that
+# glob metacharacters in dir_name (*, ?, [, ]) are handled safely.
+list_backups() {
+    local dir_name="$1" output_dir="$2"
+    local prefix="bak.${dir_name}."
+    local -a all_files=()
+    while IFS= read -r f; do
+        [ -n "$f" ] && all_files+=("$f")
+    done < <(ls -1t "$output_dir"/bak.*.tgz "$output_dir"/bak.*.tgz.gpg \
+                    "$output_dir"/bak.*.tbz2 "$output_dir"/bak.*.tbz2.gpg \
+                    "$output_dir"/bak.*.txz "$output_dir"/bak.*.txz.gpg \
+                    "$output_dir"/bak.*.tzst "$output_dir"/bak.*.tzst.gpg \
+                    2>/dev/null)
+    local f bn
+    for f in "${all_files[@]}"; do
+        bn=$(basename "$f")
+        # Quoted prefix is literal in [[ ]]; [0-9]* anchors to a date
+        if [[ "$bn" == "${prefix}"[0-9]* ]]; then
+            echo "$f"
+        fi
+    done
+}
+
 do_retention() {
     local dir_name="$1" output_dir="$2" keep="$3"
     local -a found=()
     while IFS= read -r f; do
         [ -n "$f" ] && found+=("$f")
-    done < <(ls -1t "$output_dir"/bak."$dir_name".*.tgz "$output_dir"/bak."$dir_name".*.tgz.gpg \
-                    "$output_dir"/bak."$dir_name".*.tbz2 "$output_dir"/bak."$dir_name".*.tbz2.gpg \
-                    "$output_dir"/bak."$dir_name".*.txz "$output_dir"/bak."$dir_name".*.txz.gpg \
-                    "$output_dir"/bak."$dir_name".*.tzst "$output_dir"/bak."$dir_name".*.tzst.gpg \
-                    2>/dev/null)
+    done < <(list_backups "$dir_name" "$output_dir")
 
     if [ ${#found[@]} -le "$keep" ]; then
         return
@@ -202,11 +293,7 @@ do_list() {
         for dn in "${dir_names[@]}"; do
             while IFS= read -r f; do
                 [ -n "$f" ] && files+=("$f")
-            done < <(ls -1t "$output_dir"/bak."$dn".*.tgz "$output_dir"/bak."$dn".*.tgz.gpg \
-                            "$output_dir"/bak."$dn".*.tbz2 "$output_dir"/bak."$dn".*.tbz2.gpg \
-                            "$output_dir"/bak."$dn".*.txz "$output_dir"/bak."$dn".*.txz.gpg \
-                            "$output_dir"/bak."$dn".*.tzst "$output_dir"/bak."$dn".*.tzst.gpg \
-                            2>/dev/null)
+            done < <(list_backups "$dn" "$output_dir")
         done
     else
         while IFS= read -r f; do
@@ -251,37 +338,45 @@ do_list() {
 }
 
 do_backup() {
-    local DIR="$1"
-    DIR=$(realpath "$DIR")
-    local DIR_NAME
-    DIR_NAME=$(basename "$DIR")
+    local BACKUP_NAME="$1"
+    shift
+    local -a BACKUP_DIRS=("$@")
     local ORIGINAL_DIR
     ORIGINAL_DIR=$(pwd)
+    local is_multi=false
+    [ ${#BACKUP_DIRS[@]} -gt 1 ] && is_multi=true
+    local bup_env=""
+    [ "$VERBOSE" = true ] && bup_env="BUP_VERBOSE=1"
 
-    # Check for and run .bup-pre.sh if it exists
-    if [ -f "$DIR/.bup-pre.sh" ]; then
-        if [ "$DRY_RUN" = true ]; then
-            msg_info "[dry-run] Would run pre-backup script: $DIR/.bup-pre.sh"
-        else
-            msg_info "Running pre-backup script..."
-            if [ "$VERBOSE" = true ]; then
-                export BUP_VERBOSE=1
+    # Run pre-backup scripts
+    if [ "$NO_SCRIPTS" = false ]; then
+        for dir in "${BACKUP_DIRS[@]}"; do
+            if [ -f "$dir/.bup-pre.sh" ]; then
+                local suffix=""
+                [ "$is_multi" = true ] && suffix=" for $(basename "$dir")"
+                if [ "$DRY_RUN" = true ]; then
+                    msg_info "[dry-run] Would run pre-backup script: $dir/.bup-pre.sh"
+                else
+                    msg_info "Running pre-backup script${suffix}..."
+                    if ! cd "$dir"; then
+                        msg_err "Cannot access directory '$dir'"
+                        return 1
+                    fi
+                    if ! env $bup_env ./.bup-pre.sh; then
+                        msg_err "Pre-backup script failed${suffix}"
+                        cd "$ORIGINAL_DIR"
+                        return 1
+                    fi
+                    cd "$ORIGINAL_DIR"
+                fi
             fi
-            cd "$DIR" && ./.bup-pre.sh
-            if [ $? -ne 0 ]; then
-                msg_err "Pre-backup script failed"
-                cd "$ORIGINAL_DIR"
-                return 1
-            fi
-            cd "$ORIGINAL_DIR"
-            unset BUP_VERBOSE
-        fi
+        done
     fi
 
     # Generate tarball name with date
     local DATE BASE_NAME TARBALL_NAME
     DATE=$(date +%Y-%m-%d)
-    BASE_NAME="bak.${DIR_NAME}.${DATE}"
+    BASE_NAME="bak.${BACKUP_NAME}.${DATE}"
     TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${FILE_EXT}"
     if [ "$ENCRYPT" = true ]; then
         TARBALL_NAME="${TARBALL_NAME}.gpg"
@@ -304,22 +399,47 @@ do_backup() {
     for pattern in "${EXCLUDE_PATTERNS[@]}"; do
         TAR_EXCLUDE_ARGS+=("--exclude=$pattern")
     done
-
+    for dir in "${BACKUP_DIRS[@]}"; do
+        build_anchored_excludes "$(basename "$dir")"
+    done
     if [ "$EXCLUDE_VCS" = true ]; then
         TAR_EXCLUDE_ARGS+=("--exclude-vcs")
     fi
 
-    # If the tarball would be created inside the directory being backed up, exclude it
+    # If the tarball would be created inside a directory being backed up, exclude it
     local REAL_OUTPUT_DIR
     REAL_OUTPUT_DIR=$(realpath "$(dirname "$TARBALL_NAME")")
-    if [[ "$REAL_OUTPUT_DIR" == "$DIR" || "$REAL_OUTPUT_DIR" == "$DIR"/* ]]; then
-        local TARBALL_REL_PATH="${REAL_OUTPUT_DIR#"$DIR"}/"
-        TARBALL_REL_PATH="${TARBALL_REL_PATH#/}"
-        TAR_EXCLUDE_ARGS+=("--exclude=${DIR_NAME}/${TARBALL_REL_PATH}$(basename "$TARBALL_NAME")")
-    fi
+    for dir in "${BACKUP_DIRS[@]}"; do
+        local dn
+        dn=$(basename "$dir")
+        if [[ "$REAL_OUTPUT_DIR" == "$dir" || "$REAL_OUTPUT_DIR" == "$dir"/* ]]; then
+            local REL_PATH="${REAL_OUTPUT_DIR#"$dir"}/"
+            REL_PATH="${REL_PATH#/}"
+            TAR_EXCLUDE_ARGS+=("--exclude=${dn}/${REL_PATH}$(basename "$TARBALL_NAME")")
+            TAR_EXCLUDE_ARGS+=("--exclude=${dn}/${REL_PATH}.bup-tmp.*")
+            if [ "$INCLUDE_BACKUPS" = false ]; then
+                local ext
+                for ext in tgz tbz2 txz tzst; do
+                    TAR_EXCLUDE_ARGS+=("--exclude=${dn}/${REL_PATH}bak.*.${ext}")
+                    TAR_EXCLUDE_ARGS+=("--exclude=${dn}/${REL_PATH}bak.*.${ext}.gpg")
+                done
+            fi
+        fi
+    done
+
+    # Build tar source arguments: -C parent1 dir1 [-C parent2 dir2 ...]
+    local -a TAR_SRC_ARGS=()
+    for dir in "${BACKUP_DIRS[@]}"; do
+        TAR_SRC_ARGS+=(-C "$(dirname "$dir")" "$(basename "$dir")")
+    done
 
     if [ "$DRY_RUN" = true ]; then
-        msg_info "[dry-run] Would create: $TARBALL_NAME"
+        if [ "$is_multi" = true ]; then
+            msg_info "[dry-run] Would create combined backup: $TARBALL_NAME"
+            msg_info "[dry-run] Directories: ${BACKUP_DIRS[*]}"
+        else
+            msg_info "[dry-run] Would create: $TARBALL_NAME"
+        fi
         msg_info "[dry-run] Compression: $COMPRESS_ALGO"
         [ ${#TAR_EXCLUDE_ARGS[@]} -gt 0 ] && msg_info "[dry-run] Excludes: ${TAR_EXCLUDE_ARGS[*]}"
         if [ "$ENCRYPT" = true ]; then
@@ -330,39 +450,39 @@ do_backup() {
             fi
         fi
     else
-        msg_info "Creating backup: $TARBALL_NAME"
+        if [ "$is_multi" = true ]; then
+            msg_info "Creating combined backup: $TARBALL_NAME"
+        else
+            msg_info "Creating backup: $TARBALL_NAME"
+        fi
 
         # Atomic write: tar to temp file, then mv
         local TEMP_FILE
         TEMP_FILE=$(mktemp "${OUTPUT_DIR}/.bup-tmp.XXXXXX")
         trap 'rm -f "$TEMP_FILE"' EXIT
 
+        # Build compression arguments
+        local -a tar_compress_args=()
+        if [ "$COMPRESS_ALGO" = "zstd" ]; then
+            tar_compress_args=(--zstd -c${TAR_VERBOSE}f)
+        else
+            tar_compress_args=(-c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f)
+        fi
+
         local tar_status
         if [ "$ENCRYPT" = true ]; then
-            # Pipe through gpg for encryption
             local -a gpg_args=()
             if [ -n "$GPG_RECIPIENT" ]; then
                 gpg_args=(--encrypt --recipient "$GPG_RECIPIENT")
             else
                 gpg_args=(--symmetric)
             fi
-            if [ "$COMPRESS_ALGO" = "zstd" ]; then
-                tar --zstd -c${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")" \
-                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
-                tar_status=${PIPESTATUS[0]}
-            else
-                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")" \
-                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
-                tar_status=${PIPESTATUS[0]}
-            fi
+            tar "${tar_compress_args[@]}" - "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}" \
+                | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
+            tar_status=${PIPESTATUS[0]}
         else
-            if [ "$COMPRESS_ALGO" = "zstd" ]; then
-                tar --zstd -c${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")"
-                tar_status=$?
-            else
-                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" -C "$(dirname "$DIR")" "$(basename "$DIR")"
-                tar_status=$?
-            fi
+            tar "${tar_compress_args[@]}" "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}"
+            tar_status=$?
         fi
 
         if [ "$tar_status" -ne 0 ]; then
@@ -377,209 +497,37 @@ do_backup() {
 
         msg_ok "Backup created successfully: $TARBALL_NAME"
 
-        # Report backup size
         local FSIZE
         FSIZE=$(du -h "$TARBALL_NAME" | cut -f1 | xargs)
         msg_info "Backup size: ${FSIZE}"
     fi
 
-    # Check for and run .bup-post.sh if it exists
-    if [ -f "$DIR/.bup-post.sh" ]; then
-        if [ "$DRY_RUN" = true ]; then
-            msg_info "[dry-run] Would run post-backup script: $DIR/.bup-post.sh"
-        else
-            msg_info "Running post-backup script..."
-            if [ "$VERBOSE" = true ]; then
-                export BUP_VERBOSE=1
-            fi
-            cd "$DIR" && ./.bup-post.sh
-            if [ $? -ne 0 ]; then
-                msg_warn "Post-backup script failed"
-            fi
-            cd "$ORIGINAL_DIR"
-            unset BUP_VERBOSE
-        fi
-    fi
-
-    # Inline retention
-    if [ "$KEEP_COUNT" -gt 0 ]; then
-        do_retention "$DIR_NAME" "$OUTPUT_DIR" "$KEEP_COUNT"
-    fi
-}
-
-do_combined_backup() {
-    local ORIGINAL_DIR
-    ORIGINAL_DIR=$(pwd)
-
-    # Build combined name from directory basenames
-    local -a dir_basenames=()
-    local dir
-    for dir in "${DIRS[@]}"; do
-        dir=$(realpath "$dir")
-        dir_basenames+=("$(basename "$dir")")
-    done
-    local COMBINED_NAME
-    COMBINED_NAME=$(IFS=+; echo "${dir_basenames[*]}")
-    # Truncate if too long (keep under 200 chars)
-    if [ ${#COMBINED_NAME} -gt 200 ]; then
-        COMBINED_NAME="${COMBINED_NAME:0:197}..."
-    fi
-
-    # Run pre-backup scripts for all dirs
-    for dir in "${DIRS[@]}"; do
-        dir=$(realpath "$dir")
-        if [ -f "$dir/.bup-pre.sh" ]; then
-            if [ "$DRY_RUN" = true ]; then
-                msg_info "[dry-run] Would run pre-backup script: $dir/.bup-pre.sh"
-            else
-                msg_info "Running pre-backup script for $(basename "$dir")..."
-                if [ "$VERBOSE" = true ]; then
-                    export BUP_VERBOSE=1
-                fi
-                cd "$dir" && ./.bup-pre.sh
-                if [ $? -ne 0 ]; then
-                    msg_err "Pre-backup script failed for $(basename "$dir")"
+    # Run post-backup scripts
+    if [ "$NO_SCRIPTS" = false ]; then
+        for dir in "${BACKUP_DIRS[@]}"; do
+            if [ -f "$dir/.bup-post.sh" ]; then
+                local suffix=""
+                [ "$is_multi" = true ] && suffix=" for $(basename "$dir")"
+                if [ "$DRY_RUN" = true ]; then
+                    msg_info "[dry-run] Would run post-backup script: $dir/.bup-post.sh"
+                else
+                    msg_info "Running post-backup script${suffix}..."
+                    if ! cd "$dir"; then
+                        msg_warn "Cannot access directory '$dir' for post-backup script"
+                    elif ! env $bup_env ./.bup-post.sh; then
+                        msg_warn "Post-backup script failed${suffix}"
+                    fi
                     cd "$ORIGINAL_DIR"
-                    return 1
                 fi
-                cd "$ORIGINAL_DIR"
-                unset BUP_VERBOSE
             fi
-        fi
-    done
-
-    # Generate tarball name
-    local DATE BASE_NAME TARBALL_NAME
-    DATE=$(date +%Y-%m-%d)
-    BASE_NAME="bak.${COMBINED_NAME}.${DATE}"
-    TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${FILE_EXT}"
-    if [ "$ENCRYPT" = true ]; then
-        TARBALL_NAME="${TARBALL_NAME}.gpg"
+        done
     fi
 
-    local SUFFIX=1
-    while [ -f "$TARBALL_NAME" ]; do
-        if [ "$ENCRYPT" = true ]; then
-            TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.${FILE_EXT}.gpg"
-        else
-            TARBALL_NAME="${OUTPUT_DIR}/${BASE_NAME}.${SUFFIX}.${FILE_EXT}"
-        fi
-        SUFFIX=$((SUFFIX + 1))
-    done
-
-    # Build exclusion arguments
-    local -a TAR_EXCLUDE_ARGS=()
-    local pattern
-    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
-        TAR_EXCLUDE_ARGS+=("--exclude=$pattern")
-    done
-    if [ "$EXCLUDE_VCS" = true ]; then
-        TAR_EXCLUDE_ARGS+=("--exclude-vcs")
+    # Retention
+    if [ "$KEEP_COUNT" -gt 0 ]; then
+        do_retention "$BACKUP_NAME" "$OUTPUT_DIR" "$KEEP_COUNT"
     fi
-
-    # Build tar source arguments: -C parent1 dir1 -C parent2 dir2 ...
-    local -a TAR_SRC_ARGS=()
-    for dir in "${DIRS[@]}"; do
-        dir=$(realpath "$dir")
-        TAR_SRC_ARGS+=(-C "$(dirname "$dir")" "$(basename "$dir")")
-    done
-
-    if [ "$DRY_RUN" = true ]; then
-        msg_info "[dry-run] Would create combined backup: $TARBALL_NAME"
-        msg_info "[dry-run] Directories: ${DIRS[*]}"
-        msg_info "[dry-run] Compression: $COMPRESS_ALGO"
-        [ ${#TAR_EXCLUDE_ARGS[@]} -gt 0 ] && msg_info "[dry-run] Excludes: ${TAR_EXCLUDE_ARGS[*]}"
-        if [ "$ENCRYPT" = true ]; then
-            if [ -n "$GPG_RECIPIENT" ]; then
-                msg_info "[dry-run] Encryption: asymmetric (recipient: $GPG_RECIPIENT)"
-            else
-                msg_info "[dry-run] Encryption: symmetric"
-            fi
-        fi
-    else
-        msg_info "Creating combined backup: $TARBALL_NAME"
-
-        local TEMP_FILE
-        TEMP_FILE=$(mktemp "${OUTPUT_DIR}/.bup-tmp.XXXXXX")
-        trap 'rm -f "$TEMP_FILE"' EXIT
-
-        local tar_status
-        if [ "$ENCRYPT" = true ]; then
-            local -a gpg_args=()
-            if [ -n "$GPG_RECIPIENT" ]; then
-                gpg_args=(--encrypt --recipient "$GPG_RECIPIENT")
-            else
-                gpg_args=(--symmetric)
-            fi
-            if [ "$COMPRESS_ALGO" = "zstd" ]; then
-                tar --zstd -c${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}" \
-                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
-                tar_status=${PIPESTATUS[0]}
-            else
-                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f - "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}" \
-                    | gpg "${gpg_args[@]}" --output "$TEMP_FILE"
-                tar_status=${PIPESTATUS[0]}
-            fi
-        else
-            if [ "$COMPRESS_ALGO" = "zstd" ]; then
-                tar --zstd -c${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}"
-                tar_status=$?
-            else
-                tar -c${TAR_COMPRESS_FLAG}${TAR_VERBOSE}f "$TEMP_FILE" "${TAR_EXCLUDE_ARGS[@]}" "${TAR_SRC_ARGS[@]}"
-                tar_status=$?
-            fi
-        fi
-
-        if [ "$tar_status" -ne 0 ]; then
-            rm -f "$TEMP_FILE"
-            trap - EXIT
-            msg_err "Failed to create tarball"
-            return 1
-        fi
-
-        mv "$TEMP_FILE" "$TARBALL_NAME"
-        trap - EXIT
-
-        msg_ok "Backup created successfully: $TARBALL_NAME"
-
-        local FSIZE
-        FSIZE=$(du -h "$TARBALL_NAME" | cut -f1 | xargs)
-        msg_info "Backup size: ${FSIZE}"
-    fi
-
-    # Run post-backup scripts for all dirs
-    for dir in "${DIRS[@]}"; do
-        dir=$(realpath "$dir")
-        if [ -f "$dir/.bup-post.sh" ]; then
-            if [ "$DRY_RUN" = true ]; then
-                msg_info "[dry-run] Would run post-backup script: $dir/.bup-post.sh"
-            else
-                msg_info "Running post-backup script for $(basename "$dir")..."
-                if [ "$VERBOSE" = true ]; then
-                    export BUP_VERBOSE=1
-                fi
-                cd "$dir" && ./.bup-post.sh
-                if [ $? -ne 0 ]; then
-                    msg_warn "Post-backup script failed for $(basename "$dir")"
-                fi
-                cd "$ORIGINAL_DIR"
-                unset BUP_VERBOSE
-            fi
-        fi
-    done
 }
-
-# --- Check for help/version flags ---
-for arg in "$@"; do
-    if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
-        show_help
-        exit 0
-    fi
-    if [ "$arg" = "-V" ] || [ "$arg" = "--version" ]; then
-        echo "bup $BUP_VERSION"
-        exit 0
-    fi
-done
 
 # --- Variable initialization ---
 OUTPUT_DIR=$(pwd)
@@ -595,8 +543,8 @@ DRY_RUN=false
 DIRS=()
 COMBINED=false
 COMPRESS_ALGO="gzip"
-TAR_COMPRESS_FLAG="z"
-FILE_EXT="tgz"
+TAR_COMPRESS_FLAG=""
+FILE_EXT=""
 ENCRYPT=false
 GPG_RECIPIENT=""
 KEEP_COUNT=0
@@ -604,9 +552,11 @@ PRUNE_ONLY=false
 PRUNE_COUNT=0
 LIST_MODE=false
 LIST_VERBOSE=false
-EXCLUDE_ARTIFACTS=false
-EXCLUDE_SECRETS=false
 SHOW_EXCLUDES=false
+SHOW_EXCLUDED=false
+NO_SCRIPTS=false
+INCLUDE_BACKUPS=false
+ANCHORED_PATTERNS=()
 
 # --- Parse arguments ---
 while [ $# -gt 0 ]; do
@@ -646,23 +596,29 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --exclude-artifacts)
-            EXCLUDE_ARTIFACTS=true
+            EXCLUDE_PATTERNS+=("${ARTIFACT_PATTERNS[@]}")
+            ANCHORED_PATTERNS+=("${ARTIFACT_PATTERNS_ANCHORED[@]}")
             SCRIPT_ARGS+=("$1")
             shift
             ;;
         --exclude-secrets)
-            EXCLUDE_SECRETS=true
+            EXCLUDE_PATTERNS+=("${SECRET_PATTERNS[@]}")
             SCRIPT_ARGS+=("$1")
             shift
             ;;
         --exclude-dev)
-            EXCLUDE_ARTIFACTS=true
-            EXCLUDE_SECRETS=true
+            EXCLUDE_PATTERNS+=("${ARTIFACT_PATTERNS[@]}")
+            ANCHORED_PATTERNS+=("${ARTIFACT_PATTERNS_ANCHORED[@]}")
+            EXCLUDE_PATTERNS+=("${SECRET_PATTERNS[@]}")
             SCRIPT_ARGS+=("$1")
             shift
             ;;
         --show-excludes)
             SHOW_EXCLUDES=true
+            shift
+            ;;
+        --show-excluded)
+            SHOW_EXCLUDED=true
             shift
             ;;
         -n|--dry-run)
@@ -703,6 +659,10 @@ while [ $# -gt 0 ]; do
                 msg_err "--keep requires a number"
                 exit 1
             fi
+            if ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -eq 0 ]; then
+                msg_err "--keep requires a positive integer"
+                exit 1
+            fi
             KEEP_COUNT="$2"
             SCRIPT_ARGS+=("$1" "$2")
             shift 2
@@ -712,9 +672,23 @@ while [ $# -gt 0 ]; do
                 msg_err "--prune requires a number"
                 exit 1
             fi
+            if ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -eq 0 ]; then
+                msg_err "--prune requires a positive integer"
+                exit 1
+            fi
             PRUNE_ONLY=true
             PRUNE_COUNT="$2"
             shift 2
+            ;;
+        --no-scripts)
+            NO_SCRIPTS=true
+            SCRIPT_ARGS+=("$1")
+            shift
+            ;;
+        --include-backups)
+            INCLUDE_BACKUPS=true
+            SCRIPT_ARGS+=("$1")
+            shift
             ;;
         --list)
             LIST_MODE=true
@@ -792,14 +766,6 @@ if [ "$ENCRYPT" = true ] && [ "$DRY_RUN" = false ]; then
     command -v gpg >/dev/null 2>&1 || { msg_err "gpg is required for encryption but not found"; exit 1; }
 fi
 
-# Merge artifact/secret patterns into EXCLUDE_PATTERNS
-if [ "$EXCLUDE_ARTIFACTS" = true ]; then
-    EXCLUDE_PATTERNS+=("${ARTIFACT_PATTERNS[@]}")
-fi
-if [ "$EXCLUDE_SECRETS" = true ]; then
-    EXCLUDE_PATTERNS+=("${SECRET_PATTERNS[@]}")
-fi
-
 # --- Standalone modes (early exit) ---
 
 # Show excludes mode
@@ -807,8 +773,27 @@ if [ "$SHOW_EXCLUDES" = true ]; then
     echo "${C_BOLD}Artifact patterns (--exclude-artifacts):${C_RESET}"
     for p in "${ARTIFACT_PATTERNS[@]}"; do echo "  $p"; done
     echo ""
+    echo "${C_BOLD}Artifact patterns, top-level only (--exclude-artifacts):${C_RESET}"
+    for p in "${ARTIFACT_PATTERNS_ANCHORED[@]}"; do echo "  $p"; done
+    echo ""
     echo "${C_BOLD}Secret patterns (--exclude-secrets):${C_RESET}"
     for p in "${SECRET_PATTERNS[@]}"; do echo "  $p"; done
+    exit 0
+fi
+
+# Show excluded files mode
+if [ "$SHOW_EXCLUDED" = true ]; then
+    if [ ${#DIRS[@]} -eq 0 ]; then
+        msg_err "At least one directory is required for --show-excluded"
+        exit 1
+    fi
+    for dir in "${DIRS[@]}"; do
+        if [ ! -d "$dir" ]; then
+            msg_err "Directory '$dir' does not exist"
+            exit 1
+        fi
+        do_show_excluded "$dir"
+    done
     exit 0
 fi
 
@@ -881,9 +866,21 @@ fi
 
 # --- Run backups ---
 if [ "$COMBINED" = true ]; then
-    do_combined_backup
+    resolved_dirs=()
+    dir_basenames=()
+    for dir in "${DIRS[@]}"; do
+        dir=$(realpath "$dir")
+        resolved_dirs+=("$dir")
+        dir_basenames+=("$(basename "$dir")")
+    done
+    combined_name=$(IFS=+; echo "${dir_basenames[*]}")
+    if [ ${#combined_name} -gt 200 ]; then
+        combined_name="${combined_name:0:197}..."
+    fi
+    do_backup "$combined_name" "${resolved_dirs[@]}"
 else
     for dir in "${DIRS[@]}"; do
-        do_backup "$dir"
+        dir=$(realpath "$dir")
+        do_backup "$(basename "$dir")" "$dir"
     done
 fi

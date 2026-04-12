@@ -53,7 +53,8 @@ DESCRIPTION:
     OUTPUT_DIR      The -o flag for alternate output directories
     VERBOSE         The -v / --verbose flag
     EXCLUDE         The -x, --exclude-vcs, --exclude-artifacts,
-                    --exclude-secrets, --exclude-dev, and --show-excludes flags
+                    --exclude-secrets, --exclude-dev, --show-excludes,
+                    --show-excluded, and anchored artifact patterns
     DRY_RUN         The -n / --dry-run flag
     MULTI_DIR       Multiple directory arguments
     COMBINED        The --combined flag
@@ -62,7 +63,8 @@ DESCRIPTION:
     RETENTION       The --keep and --prune flags
     LIST            The --list and -L / --list-verbose flags
     SAVE_SCRIPT     The -s, -S, and -d flags
-    PRE_POST        Automatic .bup-pre.sh and .bup-post.sh execution
+    PRE_POST        Automatic .bup-pre.sh and .bup-post.sh execution,
+                    and the --no-scripts flag
     NAMING          Automatic conflict-free naming with numeric suffixes
     ATOMIC          Atomic write behavior (temp file + mv)
     SIZE_REPORT     Backup size reporting after creation
@@ -452,6 +454,9 @@ test_show_excludes() {
     assert_output_contains "$out" ".env"
     assert_output_contains "$out" "Artifact patterns"
     assert_output_contains "$out" "Secret patterns"
+    assert_output_contains "$out" "top-level only"
+    assert_output_contains "$out" "bin"
+    assert_output_contains "$out" "target"
 }
 
 test_show_excludes_exits_without_backup() {
@@ -460,6 +465,64 @@ test_show_excludes_exits_without_backup() {
     local rc=0
     "$BUP" --show-excludes >/dev/null 2>&1 || rc=$?
     [ $rc -eq 0 ] || { echo "Expected exit 0 from --show-excludes"; return 1; }
+}
+
+test_exclude_artifacts_anchored() {
+    # Anchored patterns (bin, target) should only exclude at the top level
+    "$BUP" "$ASSETS/project-artifacts" --exclude-artifacts -o "$WORK" >/dev/null 2>&1
+    local tb="$WORK/bak.project-artifacts.${DATE}.tgz"
+    # Top-level target/ should be excluded
+    assert_tarball_not_contains "$tb" "project-artifacts/target/"
+    # Nested src/bin/ should be preserved
+    assert_tarball_contains "$tb" "src/bin/helper.sh"
+}
+
+test_show_excluded_lists_files() {
+    local out
+    out=$("$BUP" "$ASSETS/project-artifacts" --exclude-artifacts --show-excluded 2>&1)
+    assert_output_contains "$out" "Excluded files"
+    assert_output_contains "$out" "node_modules"
+    assert_output_contains "$out" "target"
+    # Nested src/bin/ should NOT appear in excluded list
+    assert_output_not_contains "$out" "src/bin"
+}
+
+test_show_excluded_no_excludes() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" --show-excluded 2>&1)
+    assert_output_contains "$out" "No exclusion patterns active"
+}
+
+test_show_excluded_no_dir() {
+    local rc=0
+    "$BUP" --show-excluded 2>&1 || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit for --show-excluded without dir"; return 1; }
+}
+
+test_show_excluded_no_backup_created() {
+    "$BUP" "$ASSETS/project-artifacts" --exclude-artifacts --show-excluded -o "$WORK" 2>&1
+    # No tarball should be created
+    assert_file_not_exists "$WORK/bak.project-artifacts.${DATE}.tgz"
+}
+
+test_show_excluded_with_vcs() {
+    local out
+    out=$("$BUP" "$ASSETS/project-artifacts" --exclude-vcs --show-excluded 2>&1)
+    assert_output_contains "$out" ".git"
+}
+
+test_show_excluded_with_manual_pattern() {
+    local out
+    out=$("$BUP" "$ASSETS/project-simple" -x "*.rs" --show-excluded 2>&1)
+    assert_output_contains "$out" "main.rs"
+}
+
+test_show_excluded_multiple_dirs() {
+    local out
+    out=$("$BUP" "$ASSETS/project-artifacts" "$ASSETS/project-simple" --exclude-artifacts --show-excluded 2>&1)
+    assert_output_contains "$out" "project-artifacts"
+    # project-simple has no artifacts to exclude at top level, but should still be processed
+    assert_output_contains "$out" "project-simple"
 }
 
 test_dry_run_no_file_created() {
@@ -646,6 +709,102 @@ test_prune_missing_value() {
 
 test_prune_no_dir() {
     assert_exit_nonzero "$BUP" --prune 1 -o "$WORK"
+}
+
+test_keep_does_not_affect_similar_names() {
+    # Create dirs "foo" and "foo.bar" — retention for "foo" should not touch "foo.bar"
+    local foo="$WORK/foo" foobar="$WORK/foo.bar"
+    mkdir -p "$foo" "$foobar"
+    echo "a" > "$foo/file.txt"
+    echo "b" > "$foobar/file.txt"
+    # Create 3 backups of each
+    "$BUP" "$foo" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foo" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foo" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foobar" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foobar" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foobar" -o "$WORK" >/dev/null 2>&1
+    # Keep 1 for "foo" — should leave all 3 "foo.bar" backups untouched
+    "$BUP" "$foo" --keep 1 -o "$WORK" >/dev/null 2>&1
+    local foo_count foobar_count
+    foo_count=$(ls -1 "$WORK"/bak.foo.[0-9]*.tgz 2>/dev/null | wc -l | xargs)
+    foobar_count=$(ls -1 "$WORK"/bak.foo.bar.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$foo_count" -eq 1 ] || { echo "Expected 1 foo backup after --keep 1, got $foo_count"; return 1; }
+    [ "$foobar_count" -eq 3 ] || { echo "Expected 3 foo.bar backups untouched, got $foobar_count"; return 1; }
+}
+
+test_prune_does_not_affect_similar_names() {
+    local foo="$WORK/foo" foobar="$WORK/foo.bar"
+    mkdir -p "$foo" "$foobar"
+    echo "a" > "$foo/file.txt"
+    echo "b" > "$foobar/file.txt"
+    "$BUP" "$foo" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foo" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foo" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foobar" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foobar" -o "$WORK" >/dev/null 2>&1
+    # Prune "foo" to 1 — should not touch "foo.bar"
+    "$BUP" "$foo" --prune 1 -o "$WORK" >/dev/null 2>&1
+    local foo_count foobar_count
+    foo_count=$(ls -1 "$WORK"/bak.foo.[0-9]*.tgz 2>/dev/null | wc -l | xargs)
+    foobar_count=$(ls -1 "$WORK"/bak.foo.bar.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$foo_count" -eq 1 ] || { echo "Expected 1 foo backup after prune, got $foo_count"; return 1; }
+    [ "$foobar_count" -eq 2 ] || { echo "Expected 2 foo.bar backups untouched, got $foobar_count"; return 1; }
+}
+
+test_list_does_not_show_similar_names() {
+    local foo="$WORK/foo" foobar="$WORK/foo.bar"
+    mkdir -p "$foo" "$foobar"
+    echo "a" > "$foo/file.txt"
+    echo "b" > "$foobar/file.txt"
+    "$BUP" "$foo" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$foobar" -o "$WORK" >/dev/null 2>&1
+    local out
+    out=$("$BUP" "$foo" --list -o "$WORK" 2>&1)
+    assert_output_contains "$out" "bak.foo."
+    assert_output_not_contains "$out" "bak.foo.bar."
+}
+
+test_glob_metachar_backup_and_list() {
+    # Directory name with glob metacharacters should work correctly
+    local proj="$WORK/my[project]"
+    mkdir -p "$proj"
+    echo "data" > "$proj/file.txt"
+    "$BUP" "$proj" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.my[project].${DATE}.tgz"
+    # List should find it
+    local out
+    out=$("$BUP" "$proj" --list -o "$WORK" 2>&1)
+    assert_output_contains "$out" "bak.my[project]"
+}
+
+test_glob_metachar_retention() {
+    # Retention with glob metacharacters in name should not match wrong files
+    local proj="$WORK/data*"
+    local other="$WORK/data-other"
+    mkdir -p "$proj" "$other"
+    echo "a" > "$proj/file.txt"
+    echo "b" > "$other/file.txt"
+    "$BUP" "$proj" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$proj" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$proj" -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$other" -o "$WORK" >/dev/null 2>&1
+    # Keep 1 for "data*" — should not affect "data-other"
+    "$BUP" "$proj" --keep 1 -o "$WORK" >/dev/null 2>&1
+    local other_count
+    other_count=$(ls -1 "$WORK"/bak.data-other.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$other_count" -eq 1 ] || { echo "Expected 1 data-other backup untouched, got $other_count"; return 1; }
+}
+
+test_glob_metachar_question_mark() {
+    local proj="$WORK/test?dir"
+    mkdir -p "$proj"
+    echo "a" > "$proj/file.txt"
+    "$BUP" "$proj" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.test?dir.${DATE}.tgz"
+    local out
+    out=$("$BUP" "$proj" --list -o "$WORK" 2>&1)
+    assert_output_contains "$out" "bak.test?dir"
 }
 
 test_list_mode() {
@@ -843,6 +1002,63 @@ test_backup_inside_target_dir() {
     assert_tarball_not_contains "$tb" "bak.myproj"
 }
 
+test_backup_inside_excludes_prior_backups() {
+    # Create a copy, back up twice into itself — second should not contain first
+    local proj="$WORK/myproj"
+    cp -r "$ASSETS/project-simple" "$proj"
+    "$BUP" "$proj" -o "$proj" >/dev/null 2>&1
+    assert_file_exists "$proj/bak.myproj.${DATE}.tgz"
+    "$BUP" "$proj" -o "$proj" >/dev/null 2>&1
+    local tb2="$proj/bak.myproj.${DATE}.1.tgz"
+    assert_file_exists "$tb2"
+    # Second tarball should not contain the first backup
+    assert_tarball_not_contains "$tb2" "bak.myproj.${DATE}.tgz"
+}
+
+test_backup_inside_include_backups_flag() {
+    # With --include-backups, prior backups should be included
+    local proj="$WORK/myproj"
+    cp -r "$ASSETS/project-simple" "$proj"
+    "$BUP" "$proj" -o "$proj" >/dev/null 2>&1
+    assert_file_exists "$proj/bak.myproj.${DATE}.tgz"
+    "$BUP" "$proj" --include-backups -o "$proj" >/dev/null 2>&1
+    local tb2="$proj/bak.myproj.${DATE}.1.tgz"
+    assert_file_exists "$tb2"
+    # Second tarball SHOULD contain the first backup
+    assert_tarball_contains "$tb2" "bak.myproj.${DATE}.tgz"
+}
+
+test_backup_outside_always_excludes_nothing() {
+    # When output is a separate dir, no backup exclusion happens
+    "$BUP" "$ASSETS/project-simple" -o "$WORK" >/dev/null 2>&1
+    assert_file_exists "$WORK/bak.project-simple.${DATE}.tgz"
+    # Tarball should contain normal content
+    assert_tarball_contains "$WORK/bak.project-simple.${DATE}.tgz" "project-simple/src/main.rs"
+}
+
+test_backup_inside_excludes_all_extensions() {
+    # Verify prior backups with different compression are also excluded
+    local proj="$WORK/myproj"
+    cp -r "$ASSETS/project-simple" "$proj"
+    # Create a fake prior backup with a different extension
+    touch "$proj/bak.myproj.2025-01-01.tbz2"
+    touch "$proj/bak.myproj.2025-01-01.txz"
+    touch "$proj/bak.myproj.2025-01-01.tgz.gpg"
+    "$BUP" "$proj" -o "$proj" >/dev/null 2>&1
+    local tb="$proj/bak.myproj.${DATE}.tgz"
+    assert_file_exists "$tb"
+    assert_tarball_not_contains "$tb" "bak.myproj.2025-01-01.tbz2"
+    assert_tarball_not_contains "$tb" "bak.myproj.2025-01-01.txz"
+    assert_tarball_not_contains "$tb" "bak.myproj.2025-01-01.tgz.gpg"
+}
+
+test_include_backups_saved_in_script() {
+    "$BUP" "$ASSETS/project-simple" --include-backups -s -d "$WORK" -o "$WORK" >/dev/null 2>&1
+    local content
+    content=$(cat "$WORK/backup.sh")
+    assert_output_contains "$content" "--include-backups"
+}
+
 test_combined_dry_run() {
     local out
     out=$("$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined -n -o "$WORK" 2>&1)
@@ -917,6 +1133,84 @@ test_prune_dry_run() {
     [ "$count" -eq 3 ] || { echo "Expected 3 backups after dry-run prune, got $count"; return 1; }
 }
 
+test_no_scripts_skips_pre() {
+    local out
+    out=$("$BUP" "$ASSETS/project-scripts" --no-scripts -o "$WORK" 2>&1)
+    assert_output_not_contains "$out" "Running pre-backup script"
+    assert_output_not_contains "$out" "Running post-backup script"
+    assert_file_exists "$WORK/bak.project-scripts.${DATE}.tgz"
+}
+
+test_no_scripts_combined() {
+    local out
+    out=$("$BUP" "$ASSETS/project-scripts" "$ASSETS/project-simple" --combined --no-scripts -o "$WORK" 2>&1)
+    assert_output_not_contains "$out" "Running pre-backup script"
+    assert_output_not_contains "$out" "Running post-backup script"
+    assert_file_exists "$WORK/bak.project-scripts+project-simple.${DATE}.tgz"
+}
+
+test_no_scripts_dry_run() {
+    local out
+    out=$("$BUP" "$ASSETS/project-scripts" --no-scripts -n -o "$WORK" 2>&1)
+    assert_output_not_contains "$out" "Would run pre-backup"
+    assert_output_not_contains "$out" "Would run post-backup"
+}
+
+test_no_scripts_saved_in_script() {
+    "$BUP" "$ASSETS/project-simple" --no-scripts -s -d "$WORK" -o "$WORK" >/dev/null 2>&1
+    local content
+    content=$(cat "$WORK/backup.sh")
+    assert_output_contains "$content" "--no-scripts"
+}
+
+test_keep_invalid_non_numeric() {
+    local out rc=0
+    out=$("$BUP" "$ASSETS/project-simple" --keep abc -o "$WORK" 2>&1) || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit for --keep abc"; return 1; }
+    assert_output_contains "$out" "positive integer"
+}
+
+test_keep_invalid_zero() {
+    local out rc=0
+    out=$("$BUP" "$ASSETS/project-simple" --keep 0 -o "$WORK" 2>&1) || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit for --keep 0"; return 1; }
+    assert_output_contains "$out" "positive integer"
+}
+
+test_keep_invalid_negative() {
+    local out rc=0
+    out=$("$BUP" "$ASSETS/project-simple" --keep -1 -o "$WORK" 2>&1) || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit for --keep -1"; return 1; }
+}
+
+test_prune_invalid_non_numeric() {
+    local out rc=0
+    out=$("$BUP" "$ASSETS/project-simple" --prune abc -o "$WORK" 2>&1) || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit for --prune abc"; return 1; }
+    assert_output_contains "$out" "positive integer"
+}
+
+test_prune_invalid_zero() {
+    local out rc=0
+    out=$("$BUP" "$ASSETS/project-simple" --prune 0 -o "$WORK" 2>&1) || rc=$?
+    [ $rc -ne 0 ] || { echo "Expected non-zero exit for --prune 0"; return 1; }
+    assert_output_contains "$out" "positive integer"
+}
+
+test_combined_keep_retention() {
+    # Create 3 combined backups, then one more with --keep 2
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined -o "$WORK" >/dev/null 2>&1
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined -o "$WORK" >/dev/null 2>&1
+    local count
+    count=$(ls -1 "$WORK"/bak.project-simple+project-scripts.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 3 ] || { echo "Expected 3 combined backups before retention, got $count"; return 1; }
+
+    "$BUP" "$ASSETS/project-simple" "$ASSETS/project-scripts" --combined --keep 2 -o "$WORK" >/dev/null 2>&1
+    count=$(ls -1 "$WORK"/bak.project-simple+project-scripts.*.tgz 2>/dev/null | wc -l | xargs)
+    [ "$count" -eq 2 ] || { echo "Expected 2 combined backups after --keep 2, got $count"; return 1; }
+}
+
 # =========================================================================
 # Collect all test function names
 
@@ -948,8 +1242,16 @@ ALL_TESTS=(
     "test_exclude_secrets"
     "test_exclude_dev"
     "test_exclude_artifacts_and_manual"
+    "test_exclude_artifacts_anchored"
     "test_show_excludes"
     "test_show_excludes_exits_without_backup"
+    "test_show_excluded_lists_files"
+    "test_show_excluded_no_excludes"
+    "test_show_excluded_no_dir"
+    "test_show_excluded_no_backup_created"
+    "test_show_excluded_with_vcs"
+    "test_show_excluded_with_manual_pattern"
+    "test_show_excluded_multiple_dirs"
     # DRY_RUN
     "test_dry_run_no_file_created"
     "test_dry_run_output"
@@ -964,6 +1266,7 @@ ALL_TESTS=(
     "test_combined_backup"
     "test_combined_single_tarball_only"
     "test_combined_dry_run"
+    "test_combined_keep_retention"
     # COMPRESSION
     "test_compress_gzip_default"
     "test_compress_gzip_explicit"
@@ -982,13 +1285,24 @@ ALL_TESTS=(
     # RETENTION
     "test_keep_retention"
     "test_keep_missing_value"
+    "test_keep_invalid_non_numeric"
+    "test_keep_invalid_zero"
+    "test_keep_invalid_negative"
     "test_keep_with_compression"
     "test_prune_standalone"
     "test_prune_no_new_backup"
     "test_prune_missing_value"
+    "test_prune_invalid_non_numeric"
+    "test_prune_invalid_zero"
     "test_prune_no_dir"
     "test_prune_dry_run"
+    "test_keep_does_not_affect_similar_names"
+    "test_prune_does_not_affect_similar_names"
+    "test_glob_metachar_retention"
     # LIST
+    "test_list_does_not_show_similar_names"
+    "test_glob_metachar_backup_and_list"
+    "test_glob_metachar_question_mark"
     "test_list_mode"
     "test_list_filter_by_dir"
     "test_list_verbose"
@@ -1008,10 +1322,19 @@ ALL_TESTS=(
     "test_pre_script_runs"
     "test_post_script_runs"
     "test_pre_script_failure_aborts"
+    "test_no_scripts_skips_pre"
+    "test_no_scripts_combined"
+    "test_no_scripts_dry_run"
+    "test_no_scripts_saved_in_script"
     # NAMING
     "test_naming_conflict_resolution"
     "test_naming_conflict_with_compression"
     "test_backup_inside_target_dir"
+    "test_backup_inside_excludes_prior_backups"
+    "test_backup_inside_include_backups_flag"
+    "test_backup_outside_always_excludes_nothing"
+    "test_backup_inside_excludes_all_extensions"
+    "test_include_backups_saved_in_script"
     # ATOMIC
     "test_atomic_no_temp_files_on_success"
     # SIZE_REPORT
@@ -1066,17 +1389,17 @@ for t in "${ALL_TESTS[@]}"; do
         test_basic_*)           new_section="BASIC" ;;
         test_output_*)          new_section="OUTPUT_DIR" ;;
         test_verbose_*)         new_section="VERBOSE" ;;
-        test_exclude_*|test_show_*) new_section="EXCLUDE" ;;
+        test_exclude_*|test_show_exclude*) new_section="EXCLUDE" ;;
         test_dry_run_*)         new_section="DRY_RUN" ;;
         test_multi_*)           new_section="MULTI_DIR" ;;
         test_combined_*)        new_section="COMBINED" ;;
         test_compress_*)        new_section="COMPRESSION" ;;
         test_encrypt_*)         new_section="ENCRYPTION" ;;
-        test_keep_*|test_prune_*) new_section="RETENTION" ;;
-        test_list_*)            new_section="LIST" ;;
+        test_keep_*|test_prune_*|test_glob_metachar_retention) new_section="RETENTION" ;;
+        test_list_*|test_glob_metachar_backup_*|test_glob_metachar_question_*) new_section="LIST" ;;
         test_save_script_*)     new_section="SAVE_SCRIPT" ;;
-        test_pre_*|test_post_*) new_section="PRE_POST" ;;
-        test_naming_*|test_backup_inside_*) new_section="NAMING" ;;
+        test_pre_*|test_post_*|test_no_scripts_*) new_section="PRE_POST" ;;
+        test_naming_*|test_backup_inside_*|test_backup_outside_*|test_include_backups_*) new_section="NAMING" ;;
         test_atomic_*)          new_section="ATOMIC" ;;
         test_size_*)            new_section="SIZE_REPORT" ;;
         test_color_*)           new_section="COLOR" ;;

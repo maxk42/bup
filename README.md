@@ -51,6 +51,8 @@ and environment files
 - `--exclude-dev` - Exclude both artifacts and secrets (shorthand for
 `--exclude-artifacts --exclude-secrets`)
 - `--show-excludes` - Print all exclusion patterns and exit
+- `--show-excluded` - Preview which files would be excluded from the backup
+(no backup is created)
 - `-v, --verbose` - Enable verbose output and set BUP_VERBOSE environment
 variable for pre/post scripts
 - `-n, --dry-run` - Show what would happen without creating a backup
@@ -72,6 +74,10 @@ with the same arguments (default: `./backup.sh`)
 `--save-script`)
 - `-d, --script-dir directory` - Write the script to `directory` instead of
 the current directory (implies `--save-script`)
+- `--no-scripts` - Skip automatic execution of `.bup-pre.sh` and
+`.bup-post.sh` scripts
+- `--include-backups` - Include prior backup files when the output directory
+is inside the directory being backed up (by default they are excluded)
 - `-V, --version` - Show version number and exit
 - `-h, --help` - Show this help message
 
@@ -169,22 +175,37 @@ Use `--show-excludes` to see the full list of patterns for each category:
 bup --show-excludes
 ```
 
-### Artifact Patterns
-Dependency directories: `node_modules`, `bower_components`, `vendor`,
-`.bundle`, `jspm_packages`, `packages`
+Use `--show-excluded` to preview which files would actually be excluded
+from a specific directory:
+```bash
+bup /home/user/project --exclude-dev --show-excluded
+```
 
-Build outputs: `target`, `build`, `dist`, `out`, `bin`, `obj`, `_build`,
-`cmake-build-*`, `*.egg-info`, `__pycache__`, `*.pyc`
+### Artifact Patterns
+
+The following patterns match at any depth in the directory tree:
+
+Dependency directories: `node_modules`, `bower_components`, `.bundle`,
+`jspm_packages`
+
+Build outputs: `cmake-build-*`, `*.egg-info`, `__pycache__`, `*.pyc`
 
 Caches: `.cache`, `.parcel-cache`, `.next`, `.nuxt`, `.turbo`, `.angular`,
 `.svelte-kit`, `.gradle`, `.sass-cache`, `.pytest_cache`, `.mypy_cache`,
-`.ruff_cache`, `.tox`, `.nox`, `.venv`, `venv`, `.eggs`, `.hypothesis`,
+`.ruff_cache`, `.tox`, `.nox`, `.venv`, `.eggs`, `.hypothesis`,
 `.coverage`, `htmlcov`, `.phpunit.cache`, `.jest-cache`
 
 IDE/editor: `.idea`, `.vs`, `.vscode`, `*.swp`, `*.swo`, `*~`, `.DS_Store`
 
-Misc: `artifacts`, `.terraform`, `.serverless`, `cdk.out`, `.aws-sam`,
-`.vagrant`
+Misc: `.terraform`, `.serverless`, `cdk.out`, `.aws-sam`, `.vagrant`
+
+The following patterns have generic names that could match legitimate
+project content, so they are **anchored to the top level** of the
+backed-up directory only.  For example, a top-level `bin/` is excluded
+but a nested `src/bin/` is preserved:
+
+Top-level only: `vendor`, `packages`, `target`, `build`, `dist`, `out`,
+`bin`, `obj`, `_build`, `venv`, `artifacts`
 
 ### Secret Patterns
 Environment files: `.env`, `.env.*`, `appsettings.json`,
@@ -219,6 +240,8 @@ If present, the following scripts are automatically executed:
 - If script fails, backup continues (warning issued)
 - Receives `BUP_VERBOSE=1` environment variable in verbose mode
 
+Use `--no-scripts` to disable automatic script execution entirely.
+
 ## ENVIRONMENT VARIABLES
 - `BUP_VERBOSE` - Set to "1" when --verbose flag is used, available to
 .bup-pre.sh and .bup-post.sh scripts
@@ -250,4 +273,5 @@ bup /home/user/project -L -o /backup
 bup /home/user/project --exclude-artifacts
 bup /home/user/project --exclude-dev -o /backup
 bup --show-excludes
+bup /home/user/project --exclude-dev --show-excluded
 ```
